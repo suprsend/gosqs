@@ -52,6 +52,8 @@ type consumer struct {
 	attributes        []customAttribute
 
 	logger Logger
+	//
+	messageHandlerName string
 }
 
 // NewConsumer creates a new SQS instance and provides a configured consumer interface for
@@ -96,7 +98,8 @@ func NewConsumer(c Config, queueName string) (Consumer, error) {
 		}
 		cons.QueueURL = *o.QueueUrl
 	}
-
+	//
+	cons.messageHandlerName = c.MessageHandlerName
 	return cons, nil
 }
 
@@ -156,13 +159,14 @@ func (c *consumer) Consume() {
 		}
 
 		for _, m := range output.Messages {
-			if _, ok := m.MessageAttributes["route"]; !ok {
-				//a message will be sent to the DLQ automatically after 4 tries if it is received but not deleted
-				c.Logger().Println(ErrNoRoute.Error())
-				continue
-			}
+			// ----- Messages don't need to have route attribute
+			// if _, ok := m.MessageAttributes["route"]; !ok {
+			// 	//a message will be sent to the DLQ automatically after 4 tries if it is received but not deleted
+			// 	c.Logger().Println(ErrNoRoute.Error())
+			// 	continue
+			// }
 
-			jobs <- newMessage(m)
+			jobs <- newMessage(m, c.messageHandlerName)
 		}
 	}
 }

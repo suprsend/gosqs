@@ -18,30 +18,41 @@ type Message interface {
 	DecodeModified(out interface{}, changes interface{}) error
 	// Attribute will return the custom attribute that was sent through out the request.
 	Attribute(key string) string
+
+	Body() []byte
+
+	MessageId() string
 }
 
 // message serves as a wrapper for sqs.Message as well as controls the error handling channel
 type message struct {
 	*sqs.Message
 	err chan error
+	//
+	route string
 }
 
-func newMessage(m *sqs.Message) *message {
-	return &message{m, make(chan error, 1)}
+func newMessage(m *sqs.Message, route string) *message {
+	return &message{m, make(chan error, 1), route}
 }
 
-func (m *message) body() []byte {
+func (m *message) Body() []byte {
 	return []byte(*m.Message.Body)
+}
+
+func (m *message) MessageId() string {
+	return *m.Message.MessageId
 }
 
 // Route returns the event name that is used for routing within a worker, e.g. post_published
 func (m *message) Route() string {
-	return *m.MessageAttributes["route"].StringValue
+	return m.route
+	// return *m.MessageAttributes["route"].StringValue
 }
 
 // Decode will unmarshal the message into a supplied output using json
 func (m *message) Decode(out interface{}) error {
-	return json.Unmarshal(m.body(), &out)
+	return json.Unmarshal(m.Body(), &out)
 }
 
 // DecodeModified is used for decoding the modification message, it will populate the body with the actual message and a

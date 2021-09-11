@@ -69,7 +69,7 @@ func retrievePubMessage(t *testing.T, p *publisher, queue string) Message {
 		t.Errorf("could not delete published message, got %v", err)
 	}
 
-	return newMessage(output.Messages[0])
+	return newMessage(output.Messages[0], "")
 }
 
 func getPublisher(t *testing.T) *publisher {
