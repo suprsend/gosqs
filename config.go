@@ -48,7 +48,9 @@ type Config struct {
 	// Add a custom logger, the default will be log.Println
 	Logger Logger
 
-	MessageHandlerName string
+	MessageHandlerName  string
+	MaxNumberOfMessages int
+	WaitTimeSeconds     int
 }
 
 // customAttribute add custom attributes to SNS and SQS messages. This can include correlationIds, or any additional information you would like

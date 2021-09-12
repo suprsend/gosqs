@@ -27,7 +27,7 @@ type Consumer interface {
 	//
 	// When a new message is received, it runs in a separate go-routine that will handle the full consuming of the message, error reporting
 	// and deleting
-	Consume()
+	Consume(ctx context.Context)
 	// RegisterHandler registers an event listener and an associated handler. If the event matches, the handler will
 	// be run
 	RegisterHandler(name string, h Handler, adapters ...Adapter)
@@ -53,7 +53,9 @@ type consumer struct {
 
 	logger Logger
 	//
-	messageHandlerName string
+	messageHandlerName  string
+	maxNumberOfMessages int64
+	waitTimeSeconds     int64
 }
 
 // NewConsumer creates a new SQS instance and provides a configured consumer interface for
@@ -100,6 +102,12 @@ func NewConsumer(c Config, queueName string) (Consumer, error) {
 	}
 	//
 	cons.messageHandlerName = c.MessageHandlerName
+	if c.MaxNumberOfMessages == 0 {
+		cons.maxNumberOfMessages = maxMessages
+	} else {
+		cons.maxNumberOfMessages = int64(c.MaxNumberOfMessages)
+	}
+	cons.waitTimeSeconds = int64(c.WaitTimeSeconds)
 	return cons, nil
 }
 
@@ -128,7 +136,8 @@ func (c *consumer) RegisterHandler(name string, h Handler, adapters ...Adapter) 
 }
 
 var (
-	all = "All"
+	all           = "All"
+	sentTimestamp = "SentTimestamp"
 )
 
 // Consume polls for new messages and if it finds one, decodes it, sends it to the handler and deletes it
@@ -144,29 +153,46 @@ var (
 //
 // When a new message is received, it runs in a separate go-routine that will handle the full consuming of the message, error reporting
 // and deleting
-func (c *consumer) Consume() {
+func (c *consumer) Consume(ctx context.Context) {
 	jobs := make(chan *message)
 	for w := 1; w <= c.workerPool; w++ {
 		go c.worker(w, jobs)
 	}
 
 	for {
-		output, err := c.sqs.ReceiveMessage(&sqs.ReceiveMessageInput{QueueUrl: &c.QueueURL, MaxNumberOfMessages: &maxMessages, MessageAttributeNames: []*string{&all}})
-		if err != nil {
-			c.Logger().Println("%s , retrying in 10s", ErrGetMessage.Context(err).Error())
-			time.Sleep(10 * time.Second)
-			continue
-		}
+		select {
+		case <-ctx.Done():
+			c.Logger().Println("EXITING !! gosqs.consumer.Consume(). Context cancelled.")
+			close(jobs)
+			return
+		default:
+			visTimeout := int64(c.VisibilityTimeout)
+			output, err := c.sqs.ReceiveMessage(
+				&sqs.ReceiveMessageInput{
+					MaxNumberOfMessages:   &c.maxNumberOfMessages,
+					QueueUrl:              &c.QueueURL,
+					VisibilityTimeout:     &visTimeout,
+					WaitTimeSeconds:       &c.waitTimeSeconds,
+					MessageAttributeNames: []*string{&all},
+					AttributeNames:        []*string{&sentTimestamp},
+				},
+			)
+			if err != nil {
+				c.Logger().Println("%s , retrying in 10s", ErrGetMessage.Context(err).Error())
+				time.Sleep(10 * time.Second)
+				continue
+			}
 
-		for _, m := range output.Messages {
-			// ----- Messages don't need to have route attribute
-			// if _, ok := m.MessageAttributes["route"]; !ok {
-			// 	//a message will be sent to the DLQ automatically after 4 tries if it is received but not deleted
-			// 	c.Logger().Println(ErrNoRoute.Error())
-			// 	continue
-			// }
+			for _, m := range output.Messages {
+				// ----- Messages don't need to have route attribute
+				// if _, ok := m.MessageAttributes["route"]; !ok {
+				// 	//a message will be sent to the DLQ automatically after 4 tries if it is received but not deleted
+				// 	c.Logger().Println(ErrNoRoute.Error())
+				// 	continue
+				// }
 
-			jobs <- newMessage(m, c.messageHandlerName)
+				jobs <- newMessage(m, c.messageHandlerName)
+			}
 		}
 	}
 }

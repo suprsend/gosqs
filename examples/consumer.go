@@ -7,6 +7,7 @@ import (
 )
 
 func initWorker(c gosqs.Config) {
+	ctx := context.Background()
 	// create the connection to AWS or the emulator
 	consumer, err := gosqs.NewConsumer(c, "post-worker")
 	if err != nil {
@@ -28,7 +29,7 @@ func initWorker(c gosqs.Config) {
 	h.RegisterHandlers(a...)
 
 	// begin message consumption
-	go h.Consume()
+	go h.Consume(ctx)
 }
 
 // Consumer a wrapper for the gosqs consumer
