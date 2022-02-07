@@ -102,7 +102,7 @@ func NewConsumer(c Config, queueName string) (Consumer, error) {
 	}
 	//
 	cons.messageHandlerName = c.MessageHandlerName
-	if c.MaxNumberOfMessages == 0 {
+	if c.MaxNumberOfMessages <= 0 || int64(c.MaxNumberOfMessages) > maxMessages {
 		cons.maxNumberOfMessages = maxMessages
 	} else {
 		cons.maxNumberOfMessages = int64(c.MaxNumberOfMessages)
