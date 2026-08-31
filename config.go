@@ -1,19 +1,18 @@
 package gosqs
 
 import (
+	"context"
 	"strconv"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 )
 
-// SessionProviderFunc can be used to add custom AWS session setup to the gosqs.Config.
+// SessionProviderFunc can be used to add custom AWS SDK v2 config setup to the gosqs.Config.
 // Callers simply need to implement this function type and set it as Config.SessionProvider.
 // If Config.SessionProvider is not set (is nil), a default provider based on AWS Key/Secret will be used.
-type SessionProviderFunc func(c Config) (*session.Session, error)
+type SessionProviderFunc func(c Config) (aws.Config, error)
 
 // Config defines the gosqs configuration
 type Config struct {
@@ -105,40 +104,44 @@ const DataTypeNumber = dataType("Number")
 // DataTypeString represents the String datatype, use it when creating custom attributes
 const DataTypeString = dataType("String")
 
-type retryer struct {
-	client.DefaultRetryer
-	retryCount int
-}
-
-// MaxRetries sets the total exponential back off attempts to 10 retries
-func (r retryer) MaxRetries() int {
-	if r.retryCount > 0 {
-		return r.retryCount
+func resolveAWSConfig(c Config) (aws.Config, error) {
+	if c.SessionProvider != nil {
+		return c.SessionProvider(c)
 	}
-
-	return 10
+	return newAWSConfig(c)
 }
 
-// newSession creates a new aws session.
+// newAWSConfig creates a new aws.Config from Key/Secret/Region/Hostname.
 // This will be used as the default SessionProvider if one is not set
-func newSession(c Config) (*session.Session, error) {
-	//sets credentials
-	creds := credentials.NewStaticCredentials(c.Key, c.Secret, "")
-	_, err := creds.Get()
-	if err != nil {
-		return nil, ErrInvalidCreds.Context(err)
+func newAWSConfig(c Config) (aws.Config, error) {
+	creds := credentials.NewStaticCredentialsProvider(c.Key, c.Secret, "")
+	if _, err := creds.Retrieve(context.Background()); err != nil {
+		return aws.Config{}, ErrInvalidCreds.Context(err)
 	}
 
-	r := &retryer{retryCount: c.RetryCount}
+	retries := c.RetryCount
+	if retries <= 0 {
+		retries = 10
+	}
+	// v1 MaxRetries was retries after the first try; v2 MaxAttempts is total tries.
+	maxAttempts := retries + 1
 
-	cfg := request.WithRetryer(aws.NewConfig().WithRegion(c.Region).WithCredentials(creds), r)
+	cfg := aws.Config{
+		Region:      c.Region,
+		Credentials: creds,
+		Retryer: func() aws.Retryer {
+			return retry.NewStandard(func(o *retry.StandardOptions) {
+				o.MaxAttempts = maxAttempts
+			})
+		},
+	}
 
-	//if an optional hostname config is provided, then replace the default one
+	// if an optional hostname config is provided, then replace the default one
 	//
 	// This will set the default AWS URL to a hostname of your choice. Perfect for testing, or mocking functionality
 	if c.Hostname != "" {
-		cfg.Endpoint = &c.Hostname
+		cfg.BaseEndpoint = aws.String(c.Hostname)
 	}
 
-	return session.NewSession(cfg)
+	return cfg, nil
 }

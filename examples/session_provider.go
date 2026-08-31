@@ -1,30 +1,30 @@
 package example
 
 import (
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"context"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/qhenkart/gosqs"
 )
 
 func main_with_session_provider() {
 
-	// implement a custom AWS session provider function
-	provider := func(c gosqs.Config) (*session.Session, error) {
+	// implement a custom AWS config provider function
+	provider := func(c gosqs.Config) (aws.Config, error) {
 
 		// note: this implementation just hardcodes key and secret, but it could do anything
-		creds := credentials.NewStaticCredentials("mykey", "mysecret", "")
-		_, err := creds.Get()
+		creds := credentials.NewStaticCredentialsProvider("mykey", "mysecret", "")
+		_, err := creds.Retrieve(context.Background())
 		if err != nil {
-			return nil, gosqs.ErrInvalidCreds.Context(err)
+			return aws.Config{}, gosqs.ErrInvalidCreds.Context(err)
 		}
 
-		cfg := aws.NewConfig().WithRegion("us-west-1").WithCredentials(creds)
-
-		hostname := "http://localhost:4150"
-		cfg.Endpoint = &hostname
-
-		return session.NewSession(cfg)
+		return aws.Config{
+			Region:       "us-west-1",
+			Credentials:  creds,
+			BaseEndpoint: aws.String("http://localhost:4150"),
+		}, nil
 	}
 
 	// create the gosqs Config with our custom SessionProviderFunc
