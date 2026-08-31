@@ -4,7 +4,8 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 // Message serves as the message interface for handling the message
@@ -26,22 +27,22 @@ type Message interface {
 
 // message serves as a wrapper for sqs.Message as well as controls the error handling channel
 type message struct {
-	*sqs.Message
+	types.Message
 	err chan error
 	//
 	route string
 }
 
-func newMessage(m *sqs.Message, route string) *message {
+func newMessage(m types.Message, route string) *message {
 	return &message{m, make(chan error, 1), route}
 }
 
 func (m *message) Body() []byte {
-	return []byte(*m.Message.Body)
+	return []byte(aws.ToString(m.Message.Body))
 }
 
 func (m *message) MessageId() string {
-	return *m.Message.MessageId
+	return aws.ToString(m.Message.MessageId)
 }
 
 // Route returns the event name that is used for routing within a worker, e.g. post_published
@@ -95,5 +96,5 @@ func (m *message) Attribute(key string) string {
 		return ""
 	}
 
-	return *id.StringValue
+	return aws.ToString(id.StringValue)
 }

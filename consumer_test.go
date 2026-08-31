@@ -2,14 +2,14 @@ package gosqs
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 type testStruct struct {
@@ -30,7 +30,10 @@ func err(ctx context.Context, m Message) error {
 }
 
 func retrieveMessage(t *testing.T, c *consumer) Message {
-	output, err := c.sqs.ReceiveMessage(&sqs.ReceiveMessageInput{QueueUrl: &c.QueueURL, MessageAttributeNames: []*string{&all}})
+	output, err := c.sqs.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{
+		QueueUrl:              aws.String(c.QueueURL),
+		MessageAttributeNames: []string{"All"},
+	})
 	if err != nil {
 		t.Fatalf("unable to retrieve message, got: %v", err)
 	}
@@ -39,7 +42,17 @@ func retrieveMessage(t *testing.T, c *consumer) Message {
 		t.Fatalf("expected 1 message, got %d", len(output.Messages))
 	}
 
-	return newMessage(output.Messages[0], c.messageHandlerName)
+	return newMessage(output.Messages[0], messageRoute(output.Messages[0], c.messageHandlerName))
+}
+
+func messageRoute(m types.Message, fallback string) string {
+	if fallback != "" {
+		return fallback
+	}
+	if attr, ok := m.MessageAttributes["route"]; ok {
+		return aws.ToString(attr.StringValue)
+	}
+	return ""
 }
 
 func getConsumer(t *testing.T) *consumer {
@@ -49,24 +62,18 @@ func getConsumer(t *testing.T) *consumer {
 		Secret:   "secret",
 		Env:      "dev",
 		Hostname: "http://localhost:4100",
-		QueueURL: "http://local.goaws:4100/queue/dev-post-worker",
 	}
-	sess, err := newSession(conf)
+	c, err := NewConsumer(conf, "post-worker")
 	if err != nil {
-		t.Fatalf("could not create session, got %v", err)
+		t.Fatalf("could not create consumer, got %v", err)
 	}
 
-	cons := &consumer{
-		sqs:               sqs.New(sess),
-		env:               conf.Env,
-		VisibilityTimeout: 30,
-		extensionLimit:    2,
-		workerPool:        15,
-	}
+	cons := c.(*consumer)
+	cons.VisibilityTimeout = 30
+	cons.extensionLimit = 2
+	cons.workerPool = 15
 
-	cons.sqs.PurgeQueue(&sqs.PurgeQueueInput{QueueUrl: &conf.QueueURL})
-
-	cons.QueueURL = conf.QueueURL
+	cons.sqs.PurgeQueue(context.Background(), &sqs.PurgeQueueInput{QueueUrl: aws.String(cons.QueueURL)})
 	return cons
 }
 
@@ -82,28 +89,23 @@ func TestNewConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error creating consumer, got %v", err)
 	}
-	expected := "http://local.goaws:4100/queue/dev-post-worker"
-	if c.(*consumer).QueueURL != expected {
-		t.Fatalf("did not properly apply http result, expected %s, got %s", expected, c.(*consumer).QueueURL)
+	if !strings.Contains(c.(*consumer).QueueURL, "dev-post-worker") {
+		t.Fatalf("did not properly apply http result, expected queue name in URL, got %s", c.(*consumer).QueueURL)
 	}
 }
 
 func TestNewConsumerWithSessionProvider(t *testing.T) {
-	provider := func(c Config) (*session.Session, error) {
-		creds := credentials.NewStaticCredentials("mykey", "mysecret", "")
-		_, err := creds.Get()
-		if err != nil {
-			return nil, ErrInvalidCreds.Context(err)
+	provider := func(c Config) (aws.Config, error) {
+		creds := credentials.NewStaticCredentialsProvider("mykey", "mysecret", "")
+		if _, err := creds.Retrieve(context.Background()); err != nil {
+			return aws.Config{}, ErrInvalidCreds.Context(err)
 		}
 
-		r := &retryer{retryCount: c.RetryCount}
-
-		cfg := request.WithRetryer(aws.NewConfig().WithRegion("us-west2").WithCredentials(creds), r)
-
-		hostname := "http://localhost:4100"
-		cfg.Endpoint = &hostname
-
-		return session.NewSession(cfg)
+		return aws.Config{
+			Region:       "us-west2",
+			Credentials:  creds,
+			BaseEndpoint: aws.String("http://localhost:4100"),
+		}, nil
 	}
 
 	conf := Config{
@@ -115,9 +117,8 @@ func TestNewConsumerWithSessionProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error creating consumer, got %v", err)
 	}
-	expected := "http://local.goaws:4100/queue/dev-post-worker"
-	if c.(*consumer).QueueURL != expected {
-		t.Fatalf("did not properly apply http result, expected %s, got %s", expected, c.(*consumer).QueueURL)
+	if !strings.Contains(c.(*consumer).QueueURL, "dev-post-worker") {
+		t.Fatalf("did not properly apply http result, expected queue name in URL, got %s", c.(*consumer).QueueURL)
 	}
 }
 

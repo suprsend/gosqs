@@ -1,6 +1,7 @@
 package gosqs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,13 +9,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/service/sns"
-	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
+	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/aws/smithy-go"
 )
 
 const maxRetryCount = 5
-
-var errDataLimit = errors.New("InvalidParameterValue: One or more parameters are invalid. Reason: Message must be shorter than 262144 bytes")
 
 // Notifier used for broadcasting messages
 type Notifier interface {
@@ -41,8 +44,8 @@ type Publisher interface {
 }
 
 type publisher struct {
-	sqs *sqs.SQS
-	sns *sns.SNS
+	sqs *sqs.Client
+	sns *sns.Client
 
 	arn    string
 	env    string
@@ -55,12 +58,7 @@ type publisher struct {
 
 // NewPublisher creates a new SQS/SNS publisher instance
 func NewPublisher(c Config) (Publisher, error) {
-	if c.SessionProvider == nil {
-		c.SessionProvider = newSession
-	}
-
-	sess, err := c.SessionProvider(c)
-
+	cfg, err := resolveAWSConfig(c)
 	if err != nil {
 		return nil, err
 	}
@@ -80,8 +78,8 @@ func NewPublisher(c Config) (Publisher, error) {
 	}
 
 	pub := &publisher{
-		sqs:    sqs.New(sess),
-		sns:    sns.New(sess),
+		sqs:    sqs.NewFromConfig(cfg),
+		sns:    sns.NewFromConfig(cfg),
 		arn:    arn,
 		env:    c.Env,
 		sqsURL: sqsURL,
@@ -159,36 +157,42 @@ func (p *publisher) Message(queue, event string, body interface{}) {
 	u := p.sqsURL + name
 
 	sqsInput := &sqs.SendMessageInput{
-		MessageBody:       &out,
+		MessageBody:       aws.String(out),
 		MessageAttributes: defaultSQSAttributes(event, p.attributes...),
-		QueueUrl:          &u,
+		QueueUrl:          aws.String(u),
 	}
 
 	go p.sendDirectMessage(sqsInput, event)
+}
+
+func isMessageTooLarge(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.ErrorCode() != "InvalidParameterValue" {
+		return false
+	}
+	msg := apiErr.ErrorMessage()
+	return strings.Contains(msg, "262144") || strings.Contains(msg, "shorter than")
 }
 
 // sendDirectMessage is used to handle sending and error failures in a separate go-routine
 //
 // AWS-SDK will use their own retry mechanism for a failed request utilizing exponential backoff. If they fail
 // then we will wait 10 seconds before trying again
-func (p *publisher) sendDirectMessage(input *sqs.SendMessageInput, event string, retryCount ...int) {
-	var c int
-	if len(retryCount) != 0 {
-		c = retryCount[0]
-	}
+func (p *publisher) sendDirectMessage(input *sqs.SendMessageInput, event string) {
+	for attempt := 0; attempt <= maxRetryCount; attempt++ {
+		if _, err := p.sqs.SendMessage(context.Background(), input); err != nil {
+			if isMessageTooLarge(err) {
+				panic(ErrBodyOverflow.Context(err))
+			}
 
-	if c > maxRetryCount {
-		return
-	}
-
-	if _, err := p.sqs.SendMessage(input); err != nil {
-		if err.Error() == errDataLimit.Error() {
-			panic(ErrBodyOverflow.Context(err))
+			log.Print(ErrPublish)
+			time.Sleep(10 * time.Second)
+			continue
 		}
-
-		log.Print(ErrPublish)
-		time.Sleep(10 * time.Second)
-		p.sendDirectMessage(input, event, c+1)
+		return
 	}
 }
 
@@ -196,73 +200,53 @@ func (p *publisher) sendDirectMessage(input *sqs.SendMessageInput, event string,
 //
 // AWS-SDK will use their own retry mechanism for a failed request utilizing exponential backoff. If they fail
 // then we will wait 10 seconds before trying again
-func (p *publisher) send(body interface{}, event string, retryCount ...int) {
-	var c int
-	if len(retryCount) != 0 {
-		c = retryCount[0]
-	}
-
-	if c > maxRetryCount {
-		return
-	}
-
+func (p *publisher) send(body interface{}, event string) {
 	o, err := json.Marshal(body)
 	if err != nil {
 		panic(ErrMarshal.Context(err))
 	}
 
-	out := string(o)
-	snsInput := &sns.PublishInput{Message: &out,
+	snsInput := &sns.PublishInput{
+		Message:           aws.String(string(o)),
 		MessageAttributes: defaultSNSAttributes(event, p.attributes...),
-		TopicArn:          &p.arn,
+		TopicArn:          aws.String(p.arn),
 	}
 
-	var retrier func(input *sns.PublishInput, retryCount int)
-
-	retrier = func(input *sns.PublishInput, retryCount int) {
-		if c > maxRetryCount {
-			return
-		}
-
-		_, err = p.sns.Publish(snsInput)
-		if err != nil {
-			if err.Error() == errDataLimit.Error() {
-				panic(ErrBodyOverflow.Context(err).Error())
+	for attempt := 0; attempt <= maxRetryCount; attempt++ {
+		if _, err = p.sns.Publish(context.Background(), snsInput); err != nil {
+			if isMessageTooLarge(err) {
+				panic(ErrBodyOverflow.Context(err))
 			}
 
 			log.Println(ErrPublish.Context(err), " retrying in 10s")
 			time.Sleep(10 * time.Second)
-			retrier(input, retryCount+1)
-			return
+			continue
 		}
+		return
 	}
-
-	retrier(snsInput, 0)
 }
 
 // defaultSNSAttributes provides general SNS attributes that we need for every message
-func defaultSNSAttributes(event string, ca ...customAttribute) map[string]*sns.MessageAttributeValue {
-	st := "String"
-	m := map[string]*sns.MessageAttributeValue{
-		"route": &sns.MessageAttributeValue{DataType: &st, StringValue: &event},
+func defaultSNSAttributes(event string, ca ...customAttribute) map[string]snstypes.MessageAttributeValue {
+	m := map[string]snstypes.MessageAttributeValue{
+		"route": {DataType: aws.String("String"), StringValue: aws.String(event)},
 	}
 
 	for _, attr := range ca {
-		m[attr.Title] = &sns.MessageAttributeValue{DataType: &attr.DataType, StringValue: &attr.Value}
+		m[attr.Title] = snstypes.MessageAttributeValue{DataType: aws.String(attr.DataType), StringValue: aws.String(attr.Value)}
 	}
 
 	return m
 }
 
 // defaultSQSAttributes provides general SQS attributes that we need for every message
-func defaultSQSAttributes(event string, ca ...customAttribute) map[string]*sqs.MessageAttributeValue {
-	st := "String"
-	m := map[string]*sqs.MessageAttributeValue{
-		"route": &sqs.MessageAttributeValue{DataType: &st, StringValue: &event},
+func defaultSQSAttributes(event string, ca ...customAttribute) map[string]sqstypes.MessageAttributeValue {
+	m := map[string]sqstypes.MessageAttributeValue{
+		"route": {DataType: aws.String("String"), StringValue: aws.String(event)},
 	}
 
 	for _, attr := range ca {
-		m[attr.Title] = &sqs.MessageAttributeValue{DataType: &attr.DataType, StringValue: &attr.Value}
+		m[attr.Title] = sqstypes.MessageAttributeValue{DataType: aws.String(attr.DataType), StringValue: aws.String(attr.Value)}
 	}
 
 	return m
