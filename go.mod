@@ -1,4 +1,4 @@
-module github.com/qhenkart/gosqs
+module github.com/suprsend/gosqs
 
 go 1.26
 
