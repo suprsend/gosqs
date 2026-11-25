@@ -80,6 +80,27 @@ The following settings activate an automatic reroute to the DLQ upon repetetive 
 ### Custom Middleware
 You can add custom middleware to your consumer. These will run using the adapter method before each handler is called. You can include a logger or modify the context etc
 
+## Batch Consumer
+`gosqs.New` returns a consumer that hands a `BatchHandler` up to `Options.MaxBatch` records at a time (more than 10 is fine; it accumulates across receives for up to `Options.Linger`) and acks with `DeleteMessageBatch`. It takes any `gosqs.API`, which `*sqs.Client` satisfies.
+
+```go
+c, err := gosqs.New(sqsClient, queueURL, func(ctx context.Context, recs []*gosqs.Record) gosqs.Result {
+	// return Failures for the records that must not be deleted; the zero Result acks all of them
+	return gosqs.Result{}
+}, gosqs.Options{MaxBatch: 50})
+if err != nil {
+	return err
+}
+return c.Run(ctx) // blocks until ctx is done and in-flight batches are drained
+```
+
+- A `Failure` keeps its record. `RetryAfter` sets its visibility, otherwise it reappears when the visibility lapses. Use a DLQ with `maxReceiveCount`.
+- One heartbeat extends every received, un-acked record every `Options.Heartbeat` (default `Visibility/3`), from receipt until ack, for at most `Options.MaxExtend`.
+- A handler panic fails the whole batch. A failure ID that is not in the batch fails the whole batch.
+- FIFO queues (URL ends in `.fifo`): a failure blocks every later record of its message group in that batch.
+- On shutdown, receiving stops; handlers and acks keep running for up to `Options.DrainTimeout`, then the handler context is cancelled.
+- `gosqs.PerMessage(h, n)` runs a per-message handler (`*Record` implements `gosqs.Message`), and `gosqs.Decoded[T](h)` decodes JSON bodies first.
+
 ## Testing
 You can set up a local SNS/SQS emulator using https://github.com/p4tin/goaws. Contributions have been added to this emulator specifically to support this library
 `go test ./...` runs the unit tests. The emulator tests are behind a build tag: start the emulator with `make pretest`, then run `go test -tags integration ./...`
