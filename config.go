@@ -42,9 +42,9 @@ type Config struct {
 	RetryCount int
 	// defines the total amount of goroutines that can be run by the consumer
 	WorkerPool int
-	// defines the total number of processing extensions that occur. Each proccessing extension will double the
-	// visibilitytimeout counter, ensuring the handler has more time to process the message. Default is 2 extensions (1m30s processing time)
-	// set to 0 to turn off extension processing
+	// bounds the processing extensions. While a handler runs, a heartbeat resets the message's visibility to
+	// VisibilityTimeout every VisibilityTimeout/3, for at most (ExtensionLimit+1)*VisibilityTimeout in total.
+	// Default is 2 (1m30s processing time at the default 30s). Set to 0 to turn off extension processing
 	ExtensionLimit *int
 
 	// Add custom attributes to the message. This might be a correlationId or client meta information
@@ -56,7 +56,8 @@ type Config struct {
 
 	MessageHandlerName  string
 	MaxNumberOfMessages int
-	WaitTimeSeconds     int
+	// ReceiveMessage long-poll wait in seconds, 1..20. Defaults to 20 when 0
+	WaitTimeSeconds int
 }
 
 // customAttribute add custom attributes to SNS and SQS messages. This can include correlationIds, or any additional information you would like

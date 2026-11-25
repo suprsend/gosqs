@@ -14,6 +14,10 @@ import (
 
 var maxMessages = int32(10)
 
+// defaultWaitTimeSeconds is the ReceiveMessage long-poll wait used when
+// Config.WaitTimeSeconds is unset. 20s is the SQS maximum.
+const defaultWaitTimeSeconds = int32(20)
+
 // Consumer provides an interface for receiving messages through AWS SQS and SNS
 type Consumer interface {
 	// Consume polls for new messages and if it finds one, decodes it, sends it to the handler and deletes it
@@ -110,6 +114,9 @@ func NewConsumer(c Config, queueName string) (Consumer, error) {
 		cons.maxNumberOfMessages = int32(c.MaxNumberOfMessages)
 	}
 	cons.waitTimeSeconds = int32(c.WaitTimeSeconds)
+	if cons.waitTimeSeconds == 0 {
+		cons.waitTimeSeconds = defaultWaitTimeSeconds // long polling; 0 would busy-poll an empty queue
+	}
 	return cons, nil
 }
 
@@ -177,7 +184,11 @@ func (c *consumer) Consume(ctx context.Context) {
 				return
 			}
 			c.Logger().Println(ErrGetMessage.Context(err).Error(), "retrying in 10s")
-			time.Sleep(10 * time.Second)
+			if !sleep(ctx, 10*time.Second) {
+				c.Logger().Println("EXITING !! gosqs.consumer.Consume(). Context cancelled.")
+				close(jobs)
+				return
+			}
 			continue
 		}
 
@@ -204,25 +215,26 @@ func (c *consumer) worker(id int, messages <-chan *message) {
 }
 
 // run should be run within a worker
-
-// if there is no handler for that route, then the message will be deleted and fully consumed
 //
-// if the handler exists, it will wait for the err channel to be processed. Once it receives feedback from the handler in the form
-// of a channel, it will either log the error, or consume the message
+// if there is no handler for that route, the message is not deleted: it reappears after its visibility timeout and
+// reaches the DLQ through the queue's maxReceiveCount
+//
+// while the handler runs, a heartbeat keeps the message invisible. The message is deleted only if the handler returns nil
 func (c *consumer) run(m *message) error {
-	if h, ok := c.handlers[m.Route()]; ok {
-		ctx := context.Background()
+	h, ok := c.handlers[m.Route()]
+	if !ok {
+		return ErrNoRoute.Context(fmt.Errorf("no handler registered for route %q, message %s not deleted", m.Route(), m.MessageId()))
+	}
+	ctx := context.Background()
 
-		go c.extend(ctx, m)
-		if err := h(ctx, m); err != nil {
-			return m.ErrorResponse(ctx, err)
-		}
-
-		// finish the extension channel if the message was processed successfully
-		m.Success(ctx)
+	done := make(chan struct{})
+	go c.heartbeat(ctx, m, done)
+	err := h(ctx, m)
+	close(done)
+	if err != nil {
+		return err
 	}
 
-	//deletes message if the handler was successful or if there was no handler with that route
 	return c.delete(m) //MESSAGE CONSUMED
 }
 
@@ -292,31 +304,36 @@ func (c *consumer) delete(m *message) error {
 	return nil
 }
 
-func (c *consumer) extend(ctx context.Context, m *message) {
-	var count int
-	extension := int32(c.VisibilityTimeout)
-	for {
-		//only allow 1 extensions (Default 1m30s)
-		if count >= c.extensionLimit {
+// heartbeat keeps m invisible while its handler runs: every VisibilityTimeout/3 it sets the visibility back to
+// VisibilityTimeout (relative to now) until done is closed. It gives up after 3*extensionLimit beats, so a message is
+// held for at most (extensionLimit+1)*VisibilityTimeout, the budget Config.ExtensionLimit documents. An
+// extensionLimit of 0 disables it.
+func (c *consumer) heartbeat(ctx context.Context, m *message, done <-chan struct{}) {
+	if c.extensionLimit <= 0 || c.VisibilityTimeout <= 0 {
+		return
+	}
+	vt := time.Duration(c.VisibilityTimeout) * time.Second
+	t := time.NewTicker(vt / 3)
+	defer t.Stop()
+	for beats := 0; ; beats++ {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if beats >= 3*c.extensionLimit {
 			c.Logger().Println(ErrMessageProcessing.Error(), m.Route())
 			return
 		}
-
-		count++
-		// allow 10 seconds to process the extension request
-		time.Sleep(time.Duration(c.VisibilityTimeout-10) * time.Second)
-		select {
-		case <-m.err:
-			// goroutine finished
-			return
-		default:
-			// double the allowed processing time
-			extension = extension + int32(c.VisibilityTimeout)
-			_, err := c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{QueueUrl: aws.String(c.QueueURL), ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: extension})
-			if err != nil {
-				c.Logger().Println(ErrUnableToExtend.Error(), err.Error())
-				return
-			}
+		_, err := c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+			QueueUrl:          aws.String(c.QueueURL),
+			ReceiptHandle:     m.ReceiptHandle,
+			VisibilityTimeout: int32(c.VisibilityTimeout),
+		})
+		if err != nil {
+			c.Logger().Println(ErrUnableToExtend.Error(), err.Error())
 		}
 	}
 }

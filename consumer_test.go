@@ -215,8 +215,8 @@ func TestRun(t *testing.T) {
 	t.Run("no_event", func(t *testing.T) {
 		c.Message(context.TODO(), "post-worker", "no_event", testStruct{"val"})
 		m := retrieveMessage(t, c)
-		if err := c.run(m.(*message)); err != nil {
-			t.Errorf("unexpected result, expected %v, got %v", nil, err)
+		if err := c.run(m.(*message)); !isSQSErr(err, ErrNoRoute) {
+			t.Errorf("unexpected result, expected %v, got %v", ErrNoRoute, err)
 		}
 	})
 
