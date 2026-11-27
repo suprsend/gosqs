@@ -43,7 +43,8 @@ func WithRecovery(recovery func()) Adapter {
 func WithMiddleware(f func(ctx context.Context, m Message) error) Adapter {
 	return func(fn Handler) Handler {
 		return func(ctx context.Context, m Message) error {
-			f(ctx, m)
+			// The wrapper runs for its side effect. Its error does not stop the handler.
+			_ = f(ctx, m)
 
 			return fn(ctx, m)
 		}

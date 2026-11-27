@@ -69,8 +69,7 @@ func TestDecode(t *testing.T) {
 
 func TestErrorResponse(t *testing.T) {
 	m := NewStubMessage(t, sample{"name"})
-	m.ErrorResponse(context.TODO(), gosqs.ErrUnableToDelete)
-	if gosqs.ErrUnableToDelete.Error() != m.Err.Error() {
+	if err := m.ErrorResponse(context.TODO(), gosqs.ErrUnableToDelete); err == nil || gosqs.ErrUnableToDelete.Error() != m.Err.Error() {
 		t.Fatalf("did not attach error to message, got %v, expected %v", m.Err, gosqs.ErrUnableToDelete)
 	}
 }

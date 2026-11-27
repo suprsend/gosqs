@@ -90,7 +90,7 @@ func NewPublisher(c Config) (Publisher, error) {
 
 func (p *publisher) event(n Notifier, action string) string {
 	if p.camelCase {
-		return fmt.Sprintf("%s%s", n.ModelName(), strings.Title(action))
+		return fmt.Sprintf("%s%s", n.ModelName(), strings.Title(action)) //nolint:staticcheck // SA1019: event names keep strings.Title's historical casing
 	}
 
 	return fmt.Sprintf("%s_%s", n.ModelName(), action)
