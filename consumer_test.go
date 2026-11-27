@@ -11,7 +11,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 type testStruct struct {
@@ -45,16 +44,6 @@ func retrieveMessage(t *testing.T, c *consumer) Message {
 	}
 
 	return newMessage(output.Messages[0], messageRoute(output.Messages[0], c.messageHandlerName))
-}
-
-func messageRoute(m types.Message, fallback string) string {
-	if fallback != "" {
-		return fallback
-	}
-	if attr, ok := m.MessageAttributes["route"]; ok {
-		return aws.ToString(attr.StringValue)
-	}
-	return ""
 }
 
 func getConsumer(t *testing.T) *consumer {

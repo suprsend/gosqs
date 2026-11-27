@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -53,7 +54,6 @@ type consumer struct {
 	Hostname          string
 	VisibilityTimeout int
 	workerPool        int
-	workerCount       int
 	extensionLimit    int
 	attributes        []customAttribute
 
@@ -200,7 +200,7 @@ func (c *consumer) Consume(ctx context.Context) {
 			//     continue
 			// }
 
-			jobs <- newMessage(m, c.messageHandlerName)
+			jobs <- newMessage(m, messageRoute(m, c.messageHandlerName))
 		}
 	}
 }
@@ -228,13 +228,28 @@ func (c *consumer) run(m *message) error {
 	ctx := context.Background()
 
 	done := make(chan struct{})
-	go c.heartbeat(ctx, m, done)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		c.heartbeat(ctx, m, done)
+	}()
+	// Close done on every return, including a panic that escapes the handler,
+	// and wait until the heartbeat goroutine has left so a late extend cannot
+	// race the caller (or a test) observing the message.
+	var once sync.Once
+	stopHeartbeat := func() {
+		once.Do(func() {
+			close(done)
+			<-exited
+		})
+	}
+	defer stopHeartbeat()
+
 	err := h(ctx, m)
-	close(done)
 	if err != nil {
 		return err
 	}
-
+	stopHeartbeat()
 	return c.delete(m) //MESSAGE CONSUMED
 }
 
@@ -304,18 +319,21 @@ func (c *consumer) delete(m *message) error {
 	return nil
 }
 
-// heartbeat keeps m invisible while its handler runs: every VisibilityTimeout/3 it sets the visibility back to
-// VisibilityTimeout (relative to now) until done is closed. It gives up after 3*extensionLimit beats, so a message is
-// held for at most (extensionLimit+1)*VisibilityTimeout, the budget Config.ExtensionLimit documents. An
-// extensionLimit of 0 disables it.
+// heartbeat keeps m invisible while its handler runs. Every VisibilityTimeout/3
+// it sets visibility back to VisibilityTimeout, until done is closed or the next
+// beat would hold the message past holdBudget (the previous extender's maximum).
+// An extensionLimit of 0 disables it. Each ChangeMessageVisibility call is bounded
+// by heartbeatCallTimeout and is skipped when the handler has already finished.
 func (c *consumer) heartbeat(ctx context.Context, m *message, done <-chan struct{}) {
 	if c.extensionLimit <= 0 || c.VisibilityTimeout <= 0 {
 		return
 	}
 	vt := time.Duration(c.VisibilityTimeout) * time.Second
+	budget := holdBudget(vt, c.extensionLimit)
+	timeout := heartbeatCallTimeout(vt)
 	t := time.NewTicker(vt / 3)
 	defer t.Stop()
-	for beats := 0; ; beats++ {
+	for beat := 1; ; beat++ {
 		select {
 		case <-done:
 			return
@@ -323,17 +341,55 @@ func (c *consumer) heartbeat(ctx context.Context, m *message, done <-chan struct
 			return
 		case <-t.C:
 		}
-		if beats >= 3*c.extensionLimit {
+		if beatHoldsPastBudget(beat, vt, budget) {
 			c.Logger().Println(ErrMessageProcessing.Error(), m.Route())
 			return
 		}
-		_, err := c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		default:
+		}
+		callCtx, cancel := context.WithTimeout(ctx, timeout)
+		_, err := c.sqs.ChangeMessageVisibility(callCtx, &sqs.ChangeMessageVisibilityInput{
 			QueueUrl:          aws.String(c.QueueURL),
 			ReceiptHandle:     m.ReceiptHandle,
 			VisibilityTimeout: int32(c.VisibilityTimeout),
 		})
+		cancel()
 		if err != nil {
 			c.Logger().Println(ErrUnableToExtend.Error(), err.Error())
 		}
 	}
+}
+
+// holdBudget is how long the previous extender kept a receipt invisible:
+// L*(VT-10)+(L+1)*VT. The old loop slept VT-10 before each extend; a
+// non-positive sleep (VT <= 10) returned immediately, and the final visibility
+// was (L+1)*VT, so the slack is clamped at zero.
+func holdBudget(vt time.Duration, limit int) time.Duration {
+	slack := vt - 10*time.Second
+	if slack < 0 {
+		slack = 0
+	}
+	return time.Duration(limit)*slack + time.Duration(limit+1)*vt
+}
+
+// beatHoldsPastBudget reports whether beat (1-based), scheduled at beat*(VT/3),
+// would push the receipt's visibility deadline past budget.
+func beatHoldsPastBudget(beat int, vt, budget time.Duration) bool {
+	scheduled := time.Duration(beat) * (vt / 3)
+	return scheduled+vt > budget
+}
+
+// heartbeatCallTimeout bounds one extend RPC, including the client's retries,
+// to min(5s, VT/3) so it stays inside the gap before the next beat.
+func heartbeatCallTimeout(vt time.Duration) time.Duration {
+	d := vt / 3
+	if d > 5*time.Second {
+		return 5 * time.Second
+	}
+	return d
 }
