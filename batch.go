@@ -43,6 +43,9 @@ type Record struct {
 	ReceiveCount  int
 	SentAt        time.Time
 	receivedAt    time.Time
+	// groupSeq is the FIFO arrival order of this record within GroupID.
+	// Assigned when the record is batched; zero for standard queues.
+	groupSeq int
 }
 
 func (r *Record) Body() []byte                 { return r.Data }
@@ -56,9 +59,12 @@ func (r *Record) DecodeModified(body, changes interface{}) error {
 
 // Failure marks one record as not processed. It is not deleted.
 type Failure struct {
-	ID         string
-	Err        error
-	RetryAfter time.Duration // 0: redeliver when the current visibility lapses
+	ID  string
+	Err error
+	// RetryAfter delays redelivery. 0 leaves the current visibility to lapse.
+	// SQS visibility is whole seconds and treats 0 as immediately visible, so a
+	// positive duration below 1s is sent as 1s.
+	RetryAfter time.Duration
 }
 
 // Result reports per-record failures. The zero value means every record succeeded.
@@ -86,14 +92,21 @@ var (
 
 // Options tune the batch consumer. Zero values take the defaults in withDefaults.
 type Options struct {
-	MaxBatch     int           // records per handler call; may exceed 10. Default 10.
-	Linger       time.Duration // flush a partial batch after this. Default 200ms.
-	Workers      int           // concurrent handler calls. Default 4.
-	MaxInFlight  int           // received but not yet acked. Default Workers*MaxBatch + MaxBatch.
-	Receivers    int           // concurrent ReceiveMessage loops. Default 1.
-	WaitTime     time.Duration // long poll, 1s..20s. Default 20s.
-	Visibility   time.Duration // set on receive and on each heartbeat. Default 30s.
-	Heartbeat    time.Duration // extend in-flight receipts this often. Default Visibility/3.
+	MaxBatch    int           // records per handler call; may exceed 10. Default 10.
+	Linger      time.Duration // flush a partial batch after this. Default 200ms.
+	Workers     int           // concurrent handler calls. Default 4.
+	MaxInFlight int           // received but not yet acked. Default Workers*MaxBatch + MaxBatch.
+	Receivers   int           // concurrent ReceiveMessage loops. Default 1.
+	// WaitTime is the long-poll wait. SQS takes whole seconds in 1..20.
+	// A value in (0, 1s) is rounded up to 1s, because 0 would short-poll.
+	// Default 20s.
+	WaitTime time.Duration
+	// Visibility is set on receive and on each heartbeat. SQS takes whole
+	// seconds in 1..43200 (12h). Default 30s.
+	Visibility time.Duration
+	// Heartbeat extends in-flight receipts this often. Compared in whole
+	// seconds, it must be at least 1s under Visibility. Default Visibility/3.
+	Heartbeat    time.Duration
 	MaxExtend    time.Duration // stop extending a record this long after receipt. Default 15m.
 	DrainTimeout time.Duration // after ctx is done, wait this long before cancelling handlers. Default 30s.
 	AckTimeout   time.Duration // per delete/visibility call. Default 10s.
@@ -123,25 +136,52 @@ func (o Options) withDefaults(queueURL string) (Options, error) {
 	defD(&o.MaxExtend, 15*time.Minute)
 	defD(&o.DrainTimeout, 30*time.Second)
 	defD(&o.AckTimeout, 10*time.Second)
+	// Truncate after defaults so a sub-second WaitTime cannot become a short poll.
+	if o.WaitTime < time.Second {
+		o.WaitTime = time.Second
+	}
 	if o.FIFO == nil {
 		o.FIFO = aws.Bool(strings.HasSuffix(queueURL, ".fifo"))
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
+	waitSec := int64(o.WaitTime / time.Second)
+	visSec := int64(o.Visibility / time.Second)
+	hbSec := int64(o.Heartbeat / time.Second)
 	switch {
 	case queueURL == "":
 		return o, errors.New("gosqs: empty queue URL")
-	case o.WaitTime > 20*time.Second:
-		return o, fmt.Errorf("gosqs: WaitTime %v exceeds 20s", o.WaitTime)
-	case o.Visibility < time.Second || o.Heartbeat >= o.Visibility:
-		return o, fmt.Errorf("gosqs: need 1s <= Heartbeat(%v) < Visibility(%v)", o.Heartbeat, o.Visibility)
+	case waitSec < 1 || waitSec > 20:
+		return o, fmt.Errorf("gosqs: WaitTime %v is %ds after truncation, want 1..20", o.WaitTime, waitSec)
+	case visSec < 1 || visSec > 12*60*60:
+		return o, fmt.Errorf("gosqs: Visibility %v is %ds after truncation, want 1..43200", o.Visibility, visSec)
+	case hbSec >= visSec:
+		return o, fmt.Errorf("gosqs: Heartbeat %v (%ds) must be at least 1s under Visibility %v (%ds)", o.Heartbeat, hbSec, o.Visibility, visSec)
 	case o.Linger >= o.Visibility:
 		return o, fmt.Errorf("gosqs: Linger %v must be well under Visibility %v", o.Linger, o.Visibility)
 	case o.MaxInFlight < o.MaxBatch:
 		return o, fmt.Errorf("gosqs: MaxInFlight %d < MaxBatch %d would never fill a batch", o.MaxInFlight, o.MaxBatch)
 	}
 	return o, nil
+}
+
+// visibilitySeconds converts RetryAfter to an SQS visibility timeout.
+// Zero stays zero. Any positive duration under a second becomes 1, so the
+// call never sends 0 (immediately visible). Longer values truncate, capped at 12h.
+func visibilitySeconds(d time.Duration) int32 {
+	if d <= 0 {
+		return 0
+	}
+	secs := int32(d / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	const maxVis int32 = 12 * 60 * 60
+	if secs > maxVis {
+		return maxVis
+	}
+	return secs
 }
 
 // BatchConsumer polls one queue and dispatches batches to a BatchHandler.
@@ -157,6 +197,23 @@ type BatchConsumer struct {
 	// hbMu is held for a whole heartbeat round and around a RetryAfter
 	// backoff, so the two never interleave.
 	hbMu sync.Mutex
+
+	gatesMu sync.Mutex
+	gates   map[string]*groupGate
+}
+
+// groupGate keeps one FIFO MessageGroupId ordered across batches. seq numbers
+// follow receive order, so a batch only waits on earlier batches and the wait
+// cannot cycle. A failure blocks later already-received records of the group
+// until none of them remain in flight.
+type groupGate struct {
+	mu         sync.Mutex
+	cond       *sync.Cond
+	inflight   int // received, not yet finished (handler + delete + backoff)
+	seq        int // next sequence to assign
+	nextToRun  int // lowest sequence whose batch has not finished
+	blocked    bool
+	retryAfter time.Duration
 }
 
 // New returns a batch consumer for queueURL. api is usually an *sqs.Client.
@@ -170,7 +227,8 @@ func New(api API, queueURL string, h BatchHandler, o Options) (*BatchConsumer, e
 		return nil, err
 	}
 	return &BatchConsumer{api: api, url: queueURL, h: h, o: o,
-		sem: make(chan struct{}, o.MaxInFlight), inflight: map[*Record]struct{}{}}, nil
+		sem: make(chan struct{}, o.MaxInFlight), inflight: map[*Record]struct{}{},
+		gates: map[string]*groupGate{}}, nil
 }
 
 // Run blocks until ctx is done and every received record is acked, failed, or
@@ -283,9 +341,16 @@ func (c *BatchConsumer) receive(ctx context.Context, out chan<- *Record) {
 		delay = 100 * time.Millisecond
 		c.release(n - len(res.Messages))
 		now := time.Now()
-		for _, m := range res.Messages {
-			r := toRecord(m, now)
-			c.track(r)
+		// Count every message in this response before the first send. Otherwise a
+		// fast worker can finish (and clear a group failure) while this loop is
+		// still blocked on the accumulator and the tail is not in flight yet.
+		recs := make([]*Record, len(res.Messages))
+		for i, m := range res.Messages {
+			recs[i] = toRecord(m, now)
+			c.track(recs[i])
+			c.trackGroup(recs[i])
+		}
+		for _, r := range recs {
 			out <- r // the accumulator drains `in` until it is closed
 		}
 	}
@@ -313,6 +378,7 @@ func (c *BatchConsumer) accumulate(in <-chan *Record, out chan<- []*Record) {
 				flush()
 				return
 			}
+			c.assignGroupSeq(r) // accumulator order is the order batches run in
 			buf = append(buf, r)
 			if len(buf) == 1 {
 				timer = time.NewTimer(c.o.Linger)
@@ -329,35 +395,200 @@ func (c *BatchConsumer) accumulate(in <-chan *Record, out chan<- []*Record) {
 
 func (c *BatchConsumer) process(ctx context.Context, b []*Record) {
 	start := time.Now()
-	res := c.call(ctx, b)
-	failed := c.failures(b, res)
+	// failed is filled below. The defer reads it when process returns, after
+	// delete and backoff, so the group gate stays held through both.
+	var failed map[string]Failure
+	defer func() {
+		c.finishGroups(b, failed)
+		c.release(len(b))
+	}()
 
-	var ack []*Record
+	run, blocked := c.waitEarlierGroups(b)
+	var res Result
+	if len(run) > 0 {
+		res = c.call(ctx, run)
+	}
+	failed = c.failures(run, res)
+	for _, f := range blocked {
+		failed[f.ID] = f
+	}
+
+	var ack, drop []*Record
 	var backoff []Failure
+	byID := make(map[string]*Record, len(b))
 	for _, r := range b {
+		byID[r.ID] = r
 		f, bad := failed[r.ID]
 		switch {
 		case !bad:
 			ack = append(ack, r)
 		case f.RetryAfter > 0:
 			backoff = append(backoff, f)
+		default:
+			drop = append(drop, r)
 		}
 	}
-	// Stop heartbeating first, so a heartbeat cannot undo a backoff.
-	c.untrack(b)
-	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.o.AckTimeout)
-	defer cancel()
-	c.deleteAll(actx, ack)
-	if len(backoff) > 0 {
-		// Under hbMu, so a heartbeat round that still holds these receipts
-		// cannot land after the backoff and overwrite it.
+
+	// RetryAfter is applied before those receipts leave the heartbeat set, under
+	// hbMu, so a heartbeat cannot overwrite it. RetryAfter==0 failures are
+	// untracked here too: extending them would delay the lapse the caller asked
+	// for. Each side has its own AckTimeout. Ack receipts stay heartbeated until
+	// DeleteMessageBatch returns.
+	if len(drop) > 0 || len(backoff) > 0 {
 		c.hbMu.Lock()
-		c.backoffAll(actx, b, backoff)
+		if len(drop) > 0 {
+			c.untrack(drop)
+		}
+		if len(backoff) > 0 {
+			bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), c.o.AckTimeout)
+			c.backoffAll(bctx, b, backoff)
+			bcancel()
+			bo := make([]*Record, 0, len(backoff))
+			for _, f := range backoff {
+				bo = append(bo, byID[f.ID])
+			}
+			c.untrack(bo)
+		}
 		c.hbMu.Unlock()
 	}
-	c.release(len(b))
+	if len(ack) > 0 {
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), c.o.AckTimeout)
+		c.deleteAll(dctx, ack)
+		dcancel()
+		c.untrack(ack)
+	}
 	c.o.Logger.Debug("gosqs: batch done", "size", len(b), "acked", len(ack),
 		"failed", len(failed), "took", time.Since(start))
+}
+
+// waitEarlierGroups holds records of a FIFO group until every earlier batch
+// that contains the group has finished. Records of a group an earlier batch
+// failed are returned separately: they are not passed to the handler. Other
+// groups in the batch are left runnable.
+func (c *BatchConsumer) waitEarlierGroups(b []*Record) (run []*Record, blocked []Failure) {
+	if !c.fifo() {
+		return b, nil
+	}
+	type decision struct {
+		blocked    bool
+		retryAfter time.Duration
+	}
+	dec := make(map[string]decision)
+	for _, r := range b {
+		if r.GroupID == "" {
+			continue
+		}
+		if _, seen := dec[r.GroupID]; seen {
+			continue
+		}
+		isBlocked, retryAfter := c.gate(r.GroupID).waitTurn(r.groupSeq)
+		dec[r.GroupID] = decision{isBlocked, retryAfter}
+	}
+	for _, r := range b {
+		d, ok := dec[r.GroupID]
+		if ok && r.GroupID != "" && d.blocked {
+			blocked = append(blocked, Failure{ID: r.ID, Err: ErrGroupBlocked, RetryAfter: d.retryAfter})
+			continue
+		}
+		run = append(run, r)
+	}
+	return run, blocked
+}
+
+// finishGroups runs after handler, delete, and backoff. It records a group
+// failure for later batches and lets the next batch of that group proceed.
+// The blocked flag clears once nothing of the group is left in flight, so a
+// later redelivery is processed normally.
+func (c *BatchConsumer) finishGroups(b []*Record, failed map[string]Failure) {
+	if !c.fifo() {
+		return
+	}
+	seen := map[string]bool{}
+	for _, r := range b {
+		if r.GroupID == "" || seen[r.GroupID] {
+			continue
+		}
+		seen[r.GroupID] = true
+		var recs []*Record
+		for _, x := range b {
+			if x.GroupID == r.GroupID {
+				recs = append(recs, x)
+			}
+		}
+		minSeq := recs[0].groupSeq
+		for _, x := range recs[1:] {
+			if x.groupSeq < minSeq {
+				minSeq = x.groupSeq
+			}
+		}
+		g := c.gate(r.GroupID)
+		g.mu.Lock()
+		if !g.blocked {
+			for _, x := range recs {
+				if f, ok := failed[x.ID]; ok {
+					g.blocked = true
+					g.retryAfter = f.RetryAfter
+					break
+				}
+			}
+		}
+		// Sequences in one batch are contiguous; the next batch starts after them.
+		g.nextToRun = minSeq + len(recs)
+		g.inflight -= len(recs)
+		if g.inflight <= 0 {
+			g.inflight = 0
+			g.blocked = false
+			g.retryAfter = 0
+		}
+		g.cond.Broadcast()
+		g.mu.Unlock()
+	}
+}
+
+func (c *BatchConsumer) fifo() bool { return c.o.FIFO != nil && *c.o.FIFO }
+
+func (c *BatchConsumer) gate(id string) *groupGate {
+	c.gatesMu.Lock()
+	defer c.gatesMu.Unlock()
+	g := c.gates[id]
+	if g == nil {
+		g = &groupGate{}
+		g.cond = sync.NewCond(&g.mu)
+		c.gates[id] = g
+	}
+	return g
+}
+
+// trackGroup counts the record in flight before it is queued to the
+// accumulator, so the blocked flag survives until the tail is finished.
+func (c *BatchConsumer) trackGroup(r *Record) {
+	if !c.fifo() || r.GroupID == "" {
+		return
+	}
+	g := c.gate(r.GroupID)
+	g.mu.Lock()
+	g.inflight++
+	g.mu.Unlock()
+}
+
+func (c *BatchConsumer) assignGroupSeq(r *Record) {
+	if !c.fifo() || r.GroupID == "" {
+		return
+	}
+	g := c.gate(r.GroupID)
+	g.mu.Lock()
+	r.groupSeq = g.seq
+	g.seq++
+	g.mu.Unlock()
+}
+
+func (g *groupGate) waitTurn(seq int) (blocked bool, retryAfter time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for g.nextToRun < seq {
+		g.cond.Wait()
+	}
+	return g.blocked, g.retryAfter
 }
 
 func (c *BatchConsumer) call(ctx context.Context, b []*Record) (res Result) {
@@ -372,7 +603,8 @@ func (c *BatchConsumer) call(ctx context.Context, b []*Record) (res Result) {
 
 // failures indexes the handler's failures and applies two safety rules:
 // an unknown ID fails the whole batch, and on FIFO queues a failure blocks the
-// rest of its group, so a later message is never deleted before an earlier one.
+// rest of its group inside this batch. The per-group gate holds that order
+// across batches; this is the backstop for records that shared a handler call.
 func (c *BatchConsumer) failures(b []*Record, res Result) map[string]Failure {
 	ids := make(map[string]bool, len(b))
 	for _, r := range b {
@@ -411,13 +643,14 @@ func (c *BatchConsumer) deleteAll(ctx context.Context, recs []*Record) {
 			entries[i] = types.DeleteMessageBatchRequestEntry{Id: aws.String(strconv.Itoa(i)), ReceiptHandle: aws.String(r.ReceiptHandle)}
 		}
 		// One retry for the whole call and for retryable per-entry failures.
+		// Sender-fault entries are logged and dropped; retrying cannot help.
 		for attempt := 0; attempt < 2 && len(entries) > 0; attempt++ {
 			out, err := c.api.DeleteMessageBatch(ctx, &sqs.DeleteMessageBatchInput{QueueUrl: aws.String(c.url), Entries: entries})
 			if err != nil {
 				c.o.Logger.Error("gosqs: delete batch failed", "err", err, "n", len(entries))
 				continue
 			}
-			entries = retryable(entries, out.Failed)
+			entries = filterEntries(entries, c.retryableIDs(out.Failed))
 		}
 		if len(entries) > 0 {
 			c.o.Logger.Error("gosqs: records not deleted, will be redelivered", "n", len(entries))
@@ -425,16 +658,26 @@ func (c *BatchConsumer) deleteAll(ctx context.Context, recs []*Record) {
 	}
 }
 
-func retryable(sent []types.DeleteMessageBatchRequestEntry, failed []types.BatchResultErrorEntry) []types.DeleteMessageBatchRequestEntry {
-	var again []types.DeleteMessageBatchRequestEntry
+// retryableIDs logs sender-fault entries and returns the ids worth one retry.
+func (c *BatchConsumer) retryableIDs(failed []types.BatchResultErrorEntry) map[string]bool {
+	again := make(map[string]bool, len(failed))
 	for _, f := range failed {
+		id := aws.ToString(f.Id)
 		if f.SenderFault { // e.g. ReceiptHandleIsInvalid: retrying cannot help
+			c.o.Logger.Warn("gosqs: skipping sender-fault batch entry",
+				"id", id, "code", aws.ToString(f.Code), "message", aws.ToString(f.Message))
 			continue
 		}
-		for _, e := range sent {
-			if aws.ToString(e.Id) == aws.ToString(f.Id) {
-				again = append(again, e)
-			}
+		again[id] = true
+	}
+	return again
+}
+
+func filterEntries(sent []types.DeleteMessageBatchRequestEntry, retry map[string]bool) []types.DeleteMessageBatchRequestEntry {
+	var again []types.DeleteMessageBatchRequestEntry
+	for _, e := range sent {
+		if retry[aws.ToString(e.Id)] {
+			again = append(again, e)
 		}
 	}
 	return again
@@ -448,15 +691,50 @@ func (c *BatchConsumer) backoffAll(ctx context.Context, b []*Record, fs []Failur
 	for chunk := range slices.Chunk(fs, 10) {
 		entries := make([]types.ChangeMessageVisibilityBatchRequestEntry, len(chunk))
 		for i, f := range chunk {
-			secs := min(int32(f.RetryAfter/time.Second), 12*60*60)
 			entries[i] = types.ChangeMessageVisibilityBatchRequestEntry{
-				Id: aws.String(strconv.Itoa(i)), ReceiptHandle: aws.String(byID[f.ID].ReceiptHandle), VisibilityTimeout: secs,
+				Id: aws.String(strconv.Itoa(i)), ReceiptHandle: aws.String(byID[f.ID].ReceiptHandle),
+				VisibilityTimeout: visibilitySeconds(f.RetryAfter),
 			}
 		}
-		if _, err := c.api.ChangeMessageVisibilityBatch(ctx, &sqs.ChangeMessageVisibilityBatchInput{QueueUrl: aws.String(c.url), Entries: entries}); err != nil {
-			c.o.Logger.Warn("gosqs: backoff failed, falling back to visibility timeout", "err", err)
+		c.changeVisibility(ctx, entries, "backoff")
+	}
+}
+
+// changeVisibility sends one visibility batch and retries entries whose failure
+// is not the caller's fault a single time. Sender-fault entries are logged.
+func (c *BatchConsumer) changeVisibility(ctx context.Context, entries []types.ChangeMessageVisibilityBatchRequestEntry, op string) {
+	for attempt := 0; attempt < 2 && len(entries) > 0; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+		out, err := c.api.ChangeMessageVisibilityBatch(ctx, &sqs.ChangeMessageVisibilityBatchInput{QueueUrl: aws.String(c.url), Entries: entries})
+		if err != nil {
+			// DeadlineExceeded is this call's AckTimeout and is worth a log.
+			// Canceled means shutdown; the next loop sees ctx.Err() and returns.
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				c.o.Logger.Warn("gosqs: "+op+" failed", "err", err, "n", len(entries))
+			}
+			continue
+		}
+		var failed []types.BatchResultErrorEntry
+		if out != nil {
+			failed = out.Failed
+		}
+		entries = filterVisibility(entries, c.retryableIDs(failed))
+	}
+	if len(entries) > 0 && ctx.Err() == nil {
+		c.o.Logger.Warn("gosqs: "+op+" entries left unchanged", "n", len(entries))
+	}
+}
+
+func filterVisibility(sent []types.ChangeMessageVisibilityBatchRequestEntry, retry map[string]bool) []types.ChangeMessageVisibilityBatchRequestEntry {
+	var again []types.ChangeMessageVisibilityBatchRequestEntry
+	for _, e := range sent {
+		if retry[aws.ToString(e.Id)] {
+			again = append(again, e)
 		}
 	}
+	return again
 }
 
 // heartbeat extends every in-flight receipt in batches of 10. One goroutine
@@ -495,11 +773,8 @@ func (c *BatchConsumer) extendInFlight(ctx context.Context) {
 			}
 		}
 		cctx, cancel := context.WithTimeout(ctx, c.o.AckTimeout)
-		_, err := c.api.ChangeMessageVisibilityBatch(cctx, &sqs.ChangeMessageVisibilityBatchInput{QueueUrl: aws.String(c.url), Entries: entries})
+		c.changeVisibility(cctx, entries, "heartbeat")
 		cancel()
-		if err != nil && ctx.Err() == nil {
-			c.o.Logger.Warn("gosqs: heartbeat failed", "err", err, "n", len(entries))
-		}
 	}
 }
 

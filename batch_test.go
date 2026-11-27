@@ -1,12 +1,14 @@
 package gosqs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,10 +21,13 @@ var _ Message = (*Record)(nil)
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
-// runBatch starts a consumer, waits until cond holds (or 3s), then shuts it down.
-func runBatch(t *testing.T, f *fakeSQS, h BatchHandler, o Options, cond func() bool) {
+// startBatch runs a consumer until cancel. Logger defaults to quiet; a test
+// that wants the log passes its own.
+func startBatch(t *testing.T, f *fakeSQS, h BatchHandler, o Options) (cancel func(), done <-chan struct{}) {
 	t.Helper()
-	o.Logger = quiet
+	if o.Logger == nil {
+		o.Logger = quiet
+	}
 	if o.WaitTime == 0 {
 		o.WaitTime = time.Second
 	}
@@ -30,24 +35,48 @@ func runBatch(t *testing.T, f *fakeSQS, h BatchHandler, o Options, cond func() b
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { _ = c.Run(ctx); close(done) }()
-	deadline := time.Now().Add(3 * time.Second)
-	for !cond() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() { _ = c.Run(ctx); close(finished) }()
+	return cancelCtx, finished
+}
+
+func stopBatch(t *testing.T, cancel func(), done <-chan struct{}) {
+	t.Helper()
 	cancel()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
+}
+
+// runBatch starts a consumer, waits until cond holds (or 3s), then shuts it down.
+func runBatch(t *testing.T, f *fakeSQS, h BatchHandler, o Options, cond func() bool) {
+	t.Helper()
+	cancel, done := startBatch(t, f, h, o)
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	stopBatch(t, cancel, done)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.doubleDelete) > 0 || f.inflight < 0 {
 		t.Errorf("receipts deleted twice: %v (inflight %d)", f.doubleDelete, f.inflight)
 	}
+}
+
+func waitUntil(t *testing.T, d time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cond()
 }
 
 func ids(recs []*Record) []string {
@@ -286,7 +315,9 @@ func TestBatchConsumer_ShutdownDrainsAndAcks(t *testing.T) {
 func TestBatchConsumer_DeleteRetriesOnlyRetryableEntries(t *testing.T) {
 	f := newFake(3, nil)
 	f.failDelete = map[string]bool{"rh-m0": false, "rh-m1": true} // m0 retryable, m1 sender fault
-	runBatch(t, f, func(context.Context, []*Record) Result { return Result{} }, Options{Linger: 10 * time.Millisecond},
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	runBatch(t, f, func(context.Context, []*Record) Result { return Result{} }, Options{Linger: 10 * time.Millisecond, Logger: logger},
 		func() bool {
 			_, calls, _, _, _, _ := f.snapshot()
 			return len(calls) >= 2
@@ -298,6 +329,9 @@ func TestBatchConsumer_DeleteRetriesOnlyRetryableEntries(t *testing.T) {
 	}
 	if want := []int{3, 1}; !slices.Equal(calls, want) {
 		t.Errorf("DeleteMessageBatch entries per call = %v, want %v (retry only the non-sender-fault entry)", calls, want)
+	}
+	if got := logs.String(); !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
+		t.Errorf("sender-fault delete was not logged with id/code/message: %s", got)
 	}
 }
 
@@ -343,19 +377,27 @@ func TestBatchConsumer_MaxExtendStopsHeartbeat(t *testing.T) {
 		minCalls  int
 		maxCalls  int
 	}{
-		// Heartbeat every 200ms for a 1.3s handler: ~6 rounds without a cap.
-		{"uncapped keeps extending", 0, 5, 7},
-		{"capped at 500ms after receipt", 500 * time.Millisecond, 1, 3},
+		// MaxExtend 0 is rewritten to the default 15m, so a short handler is
+		// still extended. Heartbeat is 1s and the handler runs 2.5s: two beats,
+		// with slack for a third if delete overlaps the next tick.
+		{"default cap keeps extending a short handler", 0, 2, 4},
+		// The first beat is at 1s, by which the record is already past a 500ms cap.
+		{"capped before the first beat", 500 * time.Millisecond, 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFake(1, nil)
-			h := func(context.Context, []*Record) Result { time.Sleep(1300 * time.Millisecond); return Result{} }
-			runBatch(t, f, h, Options{Visibility: time.Second, Heartbeat: 200 * time.Millisecond, MaxExtend: tt.maxExtend,
-				Linger: 10 * time.Millisecond}, func() bool {
+			h := func(context.Context, []*Record) Result { time.Sleep(2500 * time.Millisecond); return Result{} }
+			cancel, done := startBatch(t, f, h, Options{Visibility: 4 * time.Second, Heartbeat: time.Second, MaxExtend: tt.maxExtend,
+				Linger: 10 * time.Millisecond})
+			if !waitUntil(t, 6*time.Second, func() bool {
 				d, _, _, _, _, _ := f.snapshot()
 				return len(d) == 1
-			})
+			}) {
+				stopBatch(t, cancel, done)
+				t.Fatal("record was not deleted")
+			}
+			stopBatch(t, cancel, done)
 			if _, _, _, visCalls, _, _ := f.snapshot(); visCalls < tt.minCalls || visCalls > tt.maxCalls {
 				t.Errorf("heartbeat calls = %d, want %d..%d", visCalls, tt.minCalls, tt.maxCalls)
 			}
@@ -394,7 +436,13 @@ func TestOptions_Validation(t *testing.T) {
 		{"defaults", "u", Options{}, true},
 		{"empty url", "", Options{}, false},
 		{"wait > 20s", "u", Options{WaitTime: 21 * time.Second}, false},
-		{"heartbeat >= visibility", "u", Options{Visibility: 10 * time.Second, Heartbeat: 10 * time.Second}, false},
+		{"wait 20.9s truncates into range", "u", Options{WaitTime: 20*time.Second + 900*time.Millisecond}, true},
+		{"sub-second wait rounds up", "u", Options{WaitTime: 500 * time.Millisecond}, true},
+		{"heartbeat seconds collide after truncation", "u", Options{Visibility: 10*time.Second + 500*time.Millisecond, Heartbeat: 10 * time.Second}, false},
+		{"heartbeat one second under truncated visibility", "u", Options{Visibility: 10*time.Second + 500*time.Millisecond, Heartbeat: 9 * time.Second}, true},
+		{"visibility over 12h", "u", Options{Visibility: 12*time.Hour + time.Second}, false},
+		{"visibility exactly 12h", "u", Options{Visibility: 12 * time.Hour}, true},
+		{"sub-second visibility", "u", Options{Visibility: 500 * time.Millisecond}, false},
 		{"linger >= visibility", "u", Options{Visibility: 2 * time.Second, Heartbeat: time.Second, Linger: 3 * time.Second}, false},
 		{"fifo from url", "https://x/q.fifo", Options{}, true},
 	}
@@ -407,6 +455,362 @@ func TestOptions_Validation(t *testing.T) {
 			if tt.ok && *o.FIFO != (tt.url == "https://x/q.fifo") {
 				t.Errorf("FIFO = %v", *o.FIFO)
 			}
+			if tt.ok && tt.o.WaitTime > 0 && tt.o.WaitTime < time.Second && o.WaitTime != time.Second {
+				t.Errorf("WaitTime = %v, want 1s after round-up", o.WaitTime)
+			}
 		})
+	}
+}
+
+func TestBatchConsumer_FIFOAcrossBatches(t *testing.T) {
+	boom := errors.New("boom")
+	const retry = 7 * time.Second
+	opts := func(workers, maxBatch int) Options {
+		return Options{
+			MaxBatch: maxBatch, Workers: workers, Linger: 15 * time.Millisecond, FIFO: aws.Bool(true),
+			Heartbeat: 20 * time.Second, Visibility: 30 * time.Second,
+		}
+	}
+	// headFails fails the batch that contains m0 and succeeds any other batch.
+	// A correct gate never hands the tail batch to the handler.
+	headFails := func(got *[]string, mu *sync.Mutex) BatchHandler {
+		return func(_ context.Context, recs []*Record) Result {
+			mu.Lock()
+			*got = append(*got, ids(recs)...)
+			mu.Unlock()
+			for _, r := range recs {
+				if r.ID == "m0" {
+					time.Sleep(150 * time.Millisecond) // let a second worker reach the tail
+					return Result{Failures: []Failure{{ID: "m0", Err: boom, RetryAfter: retry}}}
+				}
+			}
+			return Result{}
+		}
+	}
+	assertTailHeld := func(t *testing.T, f *fakeSQS, got []string, wantHandled, wantDeleted []string) {
+		t.Helper()
+		if !slices.Equal(got, wantHandled) {
+			t.Errorf("handler saw %v, want %v", got, wantHandled)
+		}
+		deleted, _, vis, _, _, _ := f.snapshot()
+		sort.Strings(deleted)
+		if !slices.Equal(deleted, wantDeleted) {
+			t.Errorf("deleted = %v, want %v", deleted, wantDeleted)
+		}
+		for _, id := range []string{"m0", "m1", "m2", "m3"} {
+			if slices.Contains(wantDeleted, "rh-"+id) {
+				continue
+			}
+			if vis["rh-"+id] != int32(retry/time.Second) {
+				t.Errorf("visibility[%s] = %d, want %d (RetryAfter inherited, not deleted)", id, vis["rh-"+id], int32(retry/time.Second))
+			}
+		}
+	}
+
+	t.Run("workers>1 head failure holds the tail", func(t *testing.T) {
+		f := newFake(4, func(int) string { return "g" })
+		var mu sync.Mutex
+		var got []string
+		runBatch(t, f, headFails(&got, &mu), opts(2, 2), func() bool {
+			_, _, vis, _, _, _ := f.snapshot()
+			return vis["rh-m3"] == int32(retry/time.Second)
+		})
+		mu.Lock()
+		defer mu.Unlock()
+		assertTailHeld(t, f, got, []string{"m0", "m1"}, nil)
+	})
+
+	t.Run("workers=1 head failure holds the tail", func(t *testing.T) {
+		f := newFake(4, func(int) string { return "g" })
+		var mu sync.Mutex
+		var got []string
+		runBatch(t, f, headFails(&got, &mu), opts(1, 2), func() bool {
+			_, _, vis, _, _, _ := f.snapshot()
+			return vis["rh-m3"] == int32(retry/time.Second)
+		})
+		mu.Lock()
+		defer mu.Unlock()
+		assertTailHeld(t, f, got, []string{"m0", "m1"}, nil)
+	})
+
+	t.Run("success preserves order across workers", func(t *testing.T) {
+		f := newFake(4, func(int) string { return "g" })
+		var mu sync.Mutex
+		var got []string
+		var orderOK = true
+		h := func(_ context.Context, recs []*Record) Result {
+			if recs[0].ID == "m2" {
+				d, _, _, _, _, _ := f.snapshot()
+				mu.Lock()
+				if !slices.Contains(d, "rh-m0") || !slices.Contains(d, "rh-m1") {
+					orderOK = false
+				}
+				mu.Unlock()
+			}
+			mu.Lock()
+			got = append(got, ids(recs)...)
+			mu.Unlock()
+			if recs[0].ID == "m0" {
+				time.Sleep(150 * time.Millisecond)
+			}
+			return Result{}
+		}
+		runBatch(t, f, h, opts(2, 2), func() bool {
+			d, _, _, _, _, _ := f.snapshot()
+			return len(d) == 4
+		})
+		mu.Lock()
+		defer mu.Unlock()
+		if !slices.Equal(got, []string{"m0", "m1", "m2", "m3"}) {
+			t.Errorf("handler order = %v, want m0..m3", got)
+		}
+		if !orderOK {
+			t.Error("tail batch started before the head batch was deleted")
+		}
+	})
+
+	t.Run("other groups are not blocked", func(t *testing.T) {
+		// MaxBatch 3 splits [a, b, b] and [c, b]. Failing b holds only b.
+		f := newFake(5, func(i int) string { return []string{"a", "b", "b", "c", "b"}[i] })
+		var mu sync.Mutex
+		var got []string
+		h := func(_ context.Context, recs []*Record) Result {
+			mu.Lock()
+			got = append(got, ids(recs)...)
+			mu.Unlock()
+			for _, r := range recs {
+				if r.ID == "m1" {
+					time.Sleep(100 * time.Millisecond)
+					return Result{Failures: []Failure{{ID: "m1", Err: boom, RetryAfter: retry}}}
+				}
+			}
+			return Result{}
+		}
+		runBatch(t, f, h, opts(2, 3), func() bool {
+			d, _, vis, _, _, _ := f.snapshot()
+			return len(d) >= 2 && vis["rh-m4"] == int32(retry/time.Second)
+		})
+		mu.Lock()
+		defer mu.Unlock()
+		sort.Strings(got)
+		if want := []string{"m0", "m1", "m2", "m3"}; !slices.Equal(got, want) {
+			t.Errorf("handler saw %v, want %v (m4 blocked, m3 not)", got, want)
+		}
+		deleted, _, vis, _, _, _ := f.snapshot()
+		sort.Strings(deleted)
+		if want := rh("m0", "m3"); !slices.Equal(deleted, want) {
+			t.Errorf("deleted = %v, want %v", deleted, want)
+		}
+		for _, id := range []string{"m1", "m2", "m4"} {
+			if vis["rh-"+id] != int32(retry/time.Second) {
+				t.Errorf("visibility[%s] = %d, want %d", id, vis["rh-"+id], int32(retry/time.Second))
+			}
+		}
+	})
+}
+
+func TestBatchConsumer_VisibilityEntryFailures(t *testing.T) {
+	boom := errors.New("boom")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	t.Run("heartbeat retries transient and logs sender fault", func(t *testing.T) {
+		logs.Reset()
+		f := newFake(2, nil)
+		f.failVisibility = map[string]bool{"rh-m0": false, "rh-m1": true}
+		release := make(chan struct{})
+		entered := make(chan struct{})
+		var once sync.Once
+		h := func(context.Context, []*Record) Result {
+			once.Do(func() { close(entered) })
+			<-release
+			return Result{}
+		}
+		cancel, done := startBatch(t, f, h, Options{
+			Linger: 10 * time.Millisecond, Heartbeat: time.Second, Visibility: 5 * time.Second, Logger: logger,
+		})
+		defer stopBatch(t, cancel, done)
+		defer close(release)
+		if !waitUntil(t, 4*time.Second, func() bool { return f.visAttempt("rh-m0") >= 1 && f.visAttempt("rh-m1") >= 1 }) {
+			t.Fatal("heartbeat did not run")
+		}
+		<-entered
+		time.Sleep(200 * time.Millisecond) // well under the 1s period, so only the in-round retry lands
+		if got := f.visAttempt("rh-m0"); got < 2 {
+			t.Errorf("retryable visibility attempts = %d, want >= 2", got)
+		}
+		if got := f.visAttempt("rh-m1"); got != 1 {
+			t.Errorf("sender-fault visibility attempts = %d, want 1 (no immediate retry)", got)
+		}
+		if _, _, vis, _, _, _ := f.snapshot(); vis["rh-m0"] != 5 {
+			t.Errorf("visibility[rh-m0] = %d, want 5 after retry", vis["rh-m0"])
+		}
+		if got := logs.String(); !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
+			t.Errorf("sender-fault heartbeat entry not logged: %s", got)
+		}
+	})
+
+	t.Run("backoff retries a transient entry", func(t *testing.T) {
+		f := newFake(1, nil)
+		f.failVisibility = map[string]bool{"rh-m0": false}
+		h := func(context.Context, []*Record) Result {
+			return Result{Failures: []Failure{{ID: "m0", Err: boom, RetryAfter: 45 * time.Second}}}
+		}
+		runBatch(t, f, h, Options{Linger: 10 * time.Millisecond, Heartbeat: 20 * time.Second, Visibility: 30 * time.Second}, func() bool {
+			return f.visAttempt("rh-m0") >= 2
+		})
+		if got := f.visAttempt("rh-m0"); got != 2 {
+			t.Errorf("attempts = %d, want 2", got)
+		}
+		if _, _, vis, _, _, _ := f.snapshot(); vis["rh-m0"] != 45 {
+			t.Errorf("visibility = %d, want 45", vis["rh-m0"])
+		}
+	})
+
+	t.Run("backoff logs a sender fault and does not retry it", func(t *testing.T) {
+		logs.Reset()
+		f := newFake(1, nil)
+		f.failVisibility = map[string]bool{"rh-m0": true}
+		h := func(context.Context, []*Record) Result {
+			return Result{Failures: []Failure{{ID: "m0", Err: boom, RetryAfter: 45 * time.Second}}}
+		}
+		runBatch(t, f, h, Options{Linger: 10 * time.Millisecond, Heartbeat: 20 * time.Second, Visibility: 30 * time.Second, Logger: logger}, func() bool {
+			return f.visAttempt("rh-m0") >= 1
+		})
+		if got := f.visAttempt("rh-m0"); got != 1 {
+			t.Errorf("attempts = %d, want 1", got)
+		}
+		if _, _, vis, _, _, _ := f.snapshot(); vis["rh-m0"] != 0 {
+			t.Errorf("visibility = %d, want unset", vis["rh-m0"])
+		}
+		if got := logs.String(); !strings.Contains(got, "id=0") || !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
+			t.Errorf("sender-fault backoff not logged with id, code, message: %s", got)
+		}
+	})
+}
+
+func TestBatchConsumer_RetryAfterRoundsUp(t *testing.T) {
+	boom := errors.New("boom")
+	tests := []struct {
+		name    string
+		retry   time.Duration
+		wantVis int32 // 0: visibility is not changed
+	}{
+		{"sub-second rounds up to 1s", 500 * time.Millisecond, 1},
+		{"zero does not send 0", 0, 0},
+		{"over a second truncates", 1500 * time.Millisecond, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFake(1, nil)
+			handled := make(chan struct{})
+			h := func(context.Context, []*Record) Result {
+				close(handled)
+				return Result{Failures: []Failure{{ID: "m0", Err: boom, RetryAfter: tt.retry}}}
+			}
+			cancel, done := startBatch(t, f, h, Options{Linger: 10 * time.Millisecond, Heartbeat: 20 * time.Second, Visibility: 30 * time.Second})
+			defer stopBatch(t, cancel, done)
+			select {
+			case <-handled:
+			case <-time.After(2 * time.Second):
+				t.Fatal("handler was not called")
+			}
+			if tt.wantVis > 0 {
+				if !waitUntil(t, 2*time.Second, func() bool {
+					_, _, vis, _, _, _ := f.snapshot()
+					return vis["rh-m0"] == tt.wantVis
+				}) {
+					_, _, vis, _, _, _ := f.snapshot()
+					t.Fatalf("visibility = %d, want %d", vis["rh-m0"], tt.wantVis)
+				}
+			} else {
+				// Backoff would run in the handler goroutine right after it
+				// returns. Give that goroutine time, then assert it sent nothing.
+				time.Sleep(200 * time.Millisecond)
+			}
+			if got := f.visAttempt("rh-m0"); (tt.wantVis == 0 && got != 0) || (tt.wantVis > 0 && got < 1) {
+				t.Errorf("visibility attempts = %d, wantVis %d", got, tt.wantVis)
+			}
+			if _, _, vis, _, _, _ := f.snapshot(); vis["rh-m0"] != tt.wantVis {
+				t.Errorf("visibility = %d, want %d", vis["rh-m0"], tt.wantVis)
+			}
+		})
+	}
+}
+
+func TestBatchConsumer_BackoffBeforeDeleteAndHeartbeatKeepsAck(t *testing.T) {
+	boom := errors.New("boom")
+	f := newFake(2, nil)
+	release := make(chan struct{})
+	var once sync.Once
+	releaseOnce := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(releaseOnce)
+	entered := make(chan struct{})
+	var enterOnce sync.Once
+	f.onDelete = func(context.Context) {
+		enterOnce.Do(func() { close(entered) })
+		<-release
+	}
+	h := func(context.Context, []*Record) Result {
+		return Result{Failures: []Failure{{ID: "m0", Err: boom, RetryAfter: 45 * time.Second}}}
+	}
+	cancel, done := startBatch(t, f, h, Options{
+		Linger: 10 * time.Millisecond, Heartbeat: time.Second, Visibility: 8 * time.Second, AckTimeout: 30 * time.Second,
+	})
+	defer stopBatch(t, cancel, done)
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("delete did not start")
+	}
+	if _, _, vis, _, _, _ := f.snapshot(); vis["rh-m0"] != 45 {
+		t.Fatalf("backoff not applied before delete, vis=%v", vis)
+	}
+	_, _, _, before, _, _ := f.snapshot()
+	if !waitUntil(t, 4*time.Second, func() bool {
+		_, _, vis, calls, _, _ := f.snapshot()
+		return calls > before && vis["rh-m0"] == 45 && vis["rh-m1"] == 8
+	}) {
+		_, _, vis, calls, _, _ := f.snapshot()
+		t.Fatalf("ack was not heartbeated during delete without overwriting backoff: calls %d->%d vis=%v", before, calls, vis)
+	}
+	releaseOnce()
+	if !waitUntil(t, 3*time.Second, func() bool {
+		d, _, _, _, _, _ := f.snapshot()
+		return len(d) == 1
+	}) {
+		t.Fatal("ack was not deleted")
+	}
+	deleted, _, vis, calls, _, _ := f.snapshot()
+	sort.Strings(deleted)
+	if want := rh("m1"); !slices.Equal(deleted, want) {
+		t.Errorf("deleted = %v, want %v", deleted, want)
+	}
+	if vis["rh-m0"] != 45 {
+		t.Errorf("backoff overwritten after delete: %v", vis)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if _, _, _, after, _, _ := f.snapshot(); after != calls {
+		t.Errorf("heartbeat continued after untrack: %d -> %d", calls, after)
+	}
+}
+
+func TestBatchConsumer_DeleteHasOwnAckTimeout(t *testing.T) {
+	boom := errors.New("boom")
+	f := newFake(2, nil)
+	f.blockVis = 1 // backoff waits out its own AckTimeout
+	h := func(context.Context, []*Record) Result {
+		return Result{Failures: []Failure{{ID: "m0", Err: boom, RetryAfter: 10 * time.Second}}}
+	}
+	runBatch(t, f, h, Options{
+		Linger: 10 * time.Millisecond, Heartbeat: 20 * time.Second, Visibility: 30 * time.Second, AckTimeout: 200 * time.Millisecond,
+	}, func() bool {
+		d, _, _, _, _, _ := f.snapshot()
+		return slices.Contains(d, "rh-m1")
+	})
+	deleted, _, _, _, _, _ := f.snapshot()
+	sort.Strings(deleted)
+	if want := rh("m1"); !slices.Equal(deleted, want) {
+		t.Errorf("deleted = %v, want %v (delete must not share backoff's expired context)", deleted, want)
 	}
 }

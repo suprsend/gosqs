@@ -22,18 +22,28 @@ type fakeSQS struct {
 	deleteCalls []int           // entries per DeleteMessageBatch
 	visibility  map[string]int32
 	visCalls    int
+	visAttempts map[string]int // ChangeMessageVisibilityBatch entries per receipt
 	receives    int
+	lastWait    int32
+	lastVis     int32
 	recvErr     error // returned by every ReceiveMessage while set
 	inflight    int
 	maxInflight int
 	// failDelete fails a receipt's first delete attempt as a per-entry
 	// Failed[] result; the value is its SenderFault.
-	failDelete   map[string]bool
+	failDelete map[string]bool
+	// failVisibility fails a receipt's first visibility attempt; the value is
+	// its SenderFault. Cleared so a retry can succeed.
+	failVisibility map[string]bool
+	// blockVis waits on the call context for this many visibility calls.
+	blockVis int
+	// onDelete runs without f.mu, before the delete is applied.
+	onDelete     func(ctx context.Context)
 	doubleDelete []string // receipts deleted more than once
 }
 
 func newFake(n int, group func(i int) string) *fakeSQS {
-	f := &fakeSQS{visibility: map[string]int32{}}
+	f := &fakeSQS{visibility: map[string]int32{}, visAttempts: map[string]int{}}
 	for i := range n {
 		id := "m" + strconv.Itoa(i)
 		attrs := map[string]string{"ApproximateReceiveCount": "1"}
@@ -56,6 +66,8 @@ func (f *fakeSQS) ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInpu
 		f.mu.Unlock()
 		return nil, err
 	}
+	f.lastWait = in.WaitTimeSeconds
+	f.lastVis = in.VisibilityTimeout
 	n := min(int(in.MaxNumberOfMessages), len(f.queue))
 	out := f.queue[:n:n]
 	f.queue = f.queue[n:]
@@ -72,19 +84,31 @@ func (f *fakeSQS) ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInpu
 	return &sqs.ReceiveMessageOutput{Messages: out}, nil
 }
 
-func (f *fakeSQS) DeleteMessageBatch(_ context.Context, in *sqs.DeleteMessageBatchInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageBatchOutput, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+func (f *fakeSQS) DeleteMessageBatch(ctx context.Context, in *sqs.DeleteMessageBatchInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageBatchOutput, error) {
 	if len(in.Entries) > 10 {
 		return nil, errors.New("TooManyEntriesInBatchRequest")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	hook := f.onDelete
+	f.mu.Unlock()
+	if hook != nil {
+		hook(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, len(in.Entries))
 	out := &sqs.DeleteMessageBatchOutput{}
 	for _, e := range in.Entries {
 		h := aws.ToString(e.ReceiptHandle)
 		if sender, ok := f.failDelete[h]; ok {
 			delete(f.failDelete, h)
-			out.Failed = append(out.Failed, types.BatchResultErrorEntry{Id: e.Id, SenderFault: sender, Code: aws.String("X")})
+			out.Failed = append(out.Failed, batchErr(e.Id, sender))
 			continue
 		}
 		if slices.Contains(f.deleted, h) {
@@ -96,14 +120,52 @@ func (f *fakeSQS) DeleteMessageBatch(_ context.Context, in *sqs.DeleteMessageBat
 	return out, nil
 }
 
-func (f *fakeSQS) ChangeMessageVisibilityBatch(_ context.Context, in *sqs.ChangeMessageVisibilityBatchInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+func batchErr(id *string, sender bool) types.BatchResultErrorEntry {
+	code, msg := "InternalError", "transient"
+	if sender {
+		code, msg = "ReceiptHandleIsInvalid", "bad receipt"
+	}
+	return types.BatchResultErrorEntry{Id: id, SenderFault: sender, Code: aws.String(code), Message: aws.String(msg)}
+}
+
+func (f *fakeSQS) ChangeMessageVisibilityBatch(ctx context.Context, in *sqs.ChangeMessageVisibilityBatchInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityBatchOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	block := f.blockVis > 0
+	if block {
+		f.blockVis--
+	}
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.visCalls++
-	for _, e := range in.Entries {
-		f.visibility[aws.ToString(e.ReceiptHandle)] = e.VisibilityTimeout
+	if f.visAttempts == nil {
+		f.visAttempts = map[string]int{}
 	}
-	return &sqs.ChangeMessageVisibilityBatchOutput{}, nil
+	out := &sqs.ChangeMessageVisibilityBatchOutput{}
+	for _, e := range in.Entries {
+		h := aws.ToString(e.ReceiptHandle)
+		f.visAttempts[h]++
+		if sender, ok := f.failVisibility[h]; ok {
+			delete(f.failVisibility, h)
+			out.Failed = append(out.Failed, batchErr(e.Id, sender))
+			continue
+		}
+		f.visibility[h] = e.VisibilityTimeout
+	}
+	return out, nil
+}
+
+func (f *fakeSQS) visAttempt(receipt string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.visAttempts[receipt]
 }
 
 func (f *fakeSQS) snapshot() (deleted []string, calls []int, vis map[string]int32, visCalls, receives, maxInflight int) {
