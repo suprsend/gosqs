@@ -1029,3 +1029,68 @@ func TestBatchConsumer_DeleteFailureHoldsFIFOTail(t *testing.T) {
 		}
 	})
 }
+
+func TestBatchConsumer_FIFOGateMapShrinks(t *testing.T) {
+	const n = 20
+	groups := make([]string, n)
+	for i := range groups {
+		groups[i] = "g" + string(rune('a'+i))
+	}
+	f := newFake(n, func(i int) string { return groups[i] })
+	release := make(chan struct{})
+	h := func(context.Context, []*Record) Result {
+		<-release
+		return Result{}
+	}
+	c, err := New(f, "https://sqs.local/q.fifo", h, Options{
+		MaxBatch: 10, Workers: 4, Linger: 20 * time.Millisecond, WaitTime: time.Second, Logger: quiet,
+		Heartbeat: 20 * time.Second, Visibility: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() { _ = c.Run(ctx); close(finished) }()
+	defer stopBatch(t, cancel, finished)
+
+	gateCount := func() int {
+		c.gatesMu.Lock()
+		defer c.gatesMu.Unlock()
+		return len(c.gates)
+	}
+	if !waitUntil(t, 3*time.Second, func() bool {
+		f.mu.Lock()
+		q := len(f.queue)
+		f.mu.Unlock()
+		return q == 0 && gateCount() == n
+	}) {
+		f.mu.Lock()
+		q := len(f.queue)
+		f.mu.Unlock()
+		t.Fatalf("while in flight: queue=%d gates=%d, want 0 and %d", q, gateCount(), n)
+	}
+	close(release)
+	if !waitUntil(t, 3*time.Second, func() bool {
+		d, _, _, _, _, _ := f.snapshot()
+		return len(d) == n && gateCount() == 0
+	}) {
+		d, _, _, _, _, _ := f.snapshot()
+		t.Fatalf("after idle: deleted=%d gates=%d, want %d and 0", len(d), gateCount(), n)
+	}
+
+	// The same group id is processed again after its gate was dropped.
+	f.push("again", groups[0])
+	if !waitUntil(t, 3*time.Second, func() bool {
+		d, _, _, _, _, _ := f.snapshot()
+		c.gatesMu.Lock()
+		gates := len(c.gates)
+		c.gatesMu.Unlock()
+		return slices.Contains(d, "rh-again") && gates == 0
+	}) {
+		t.Fatalf("reused group: deleted-again=%v gates=%d", func() bool {
+			d, _, _, _, _, _ := f.snapshot()
+			return slices.Contains(d, "rh-again")
+		}(), gateCount())
+	}
+}

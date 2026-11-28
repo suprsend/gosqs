@@ -51,6 +51,19 @@ type fakeSQS struct {
 	doubleDelete []string // receipts deleted more than once
 }
 
+func (f *fakeSQS) push(id, group string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	attrs := map[string]string{"ApproximateReceiveCount": "1"}
+	if group != "" {
+		attrs["MessageGroupId"] = group
+	}
+	f.queue = append(f.queue, types.Message{
+		MessageId: aws.String(id), ReceiptHandle: aws.String("rh-" + id),
+		Body: aws.String(`{}`), Attributes: attrs,
+	})
+}
+
 func newFake(n int, group func(i int) string) *fakeSQS {
 	f := &fakeSQS{visibility: map[string]int32{}, visAttempts: map[string]int{}}
 	for i := range n {

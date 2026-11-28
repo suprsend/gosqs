@@ -586,16 +586,28 @@ func (c *BatchConsumer) finishGroups(b []*Record, failed map[string]Failure) {
 			g.blocked = false
 			g.retryAfter = 0
 		}
+		idle := g.inflight == 0 && g.seq == g.nextToRun
 		g.cond.Broadcast()
 		g.mu.Unlock()
+		// Nothing of this group is tracked or waiting. Drop the gate so a
+		// long-running consumer does not retain one entry per group id.
+		if idle {
+			c.dropIdleGate(r.GroupID, g)
+		}
 	}
 }
 
 func (c *BatchConsumer) fifo() bool { return c.o.FIFO != nil && *c.o.FIFO }
 
+// gate returns the group's gate, creating it if needed. Lock order is
+// gatesMu then g.mu; callers that mutate the gate must not invert it.
 func (c *BatchConsumer) gate(id string) *groupGate {
 	c.gatesMu.Lock()
 	defer c.gatesMu.Unlock()
+	return c.gateLocked(id)
+}
+
+func (c *BatchConsumer) gateLocked(id string) *groupGate {
 	g := c.gates[id]
 	if g == nil {
 		g = &groupGate{}
@@ -605,13 +617,31 @@ func (c *BatchConsumer) gate(id string) *groupGate {
 	return g
 }
 
+// dropIdleGate removes g when it is still the map entry and still idle.
+// Rechecking under gatesMu and g.mu closes the race with trackGroup, which
+// creates or reuses the gate under the same lock order.
+func (c *BatchConsumer) dropIdleGate(id string, g *groupGate) {
+	c.gatesMu.Lock()
+	defer c.gatesMu.Unlock()
+	if c.gates[id] != g {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.inflight == 0 && g.seq == g.nextToRun {
+		delete(c.gates, id)
+	}
+}
+
 // trackGroup counts the record in flight before it is queued to the
 // accumulator, so the blocked flag survives until the tail is finished.
 func (c *BatchConsumer) trackGroup(r *Record) {
 	if !c.fifo() || r.GroupID == "" {
 		return
 	}
-	g := c.gate(r.GroupID)
+	c.gatesMu.Lock()
+	defer c.gatesMu.Unlock()
+	g := c.gateLocked(r.GroupID)
 	g.mu.Lock()
 	g.inflight++
 	g.mu.Unlock()
@@ -621,7 +651,9 @@ func (c *BatchConsumer) assignGroupSeq(r *Record) {
 	if !c.fifo() || r.GroupID == "" {
 		return
 	}
-	g := c.gate(r.GroupID)
+	c.gatesMu.Lock()
+	defer c.gatesMu.Unlock()
+	g := c.gateLocked(r.GroupID)
 	g.mu.Lock()
 	r.groupSeq = g.seq
 	g.seq++
