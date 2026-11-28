@@ -379,10 +379,12 @@ func TestBatchConsumer_MaxExtendStopsHeartbeat(t *testing.T) {
 	}{
 		// MaxExtend 0 is rewritten to the default 15m, so a short handler is
 		// still extended. Heartbeat is 1s and the handler runs 2.5s: two beats,
-		// with slack for a third if delete overlaps the next tick.
-		{"default cap keeps extending a short handler", 0, 2, 4},
-		// The first beat is at 1s, by which the record is already past a 500ms cap.
-		{"capped before the first beat", 500 * time.Millisecond, 0, 0},
+		// plus the visibility refresh before delete, with slack if a beat
+		// overlaps the delete.
+		{"default cap keeps extending a short handler", 0, 2, 5},
+		// The first beat is at 1s, by which the record is already past a 500ms
+		// cap, so the only call is the refresh before delete.
+		{"capped before the first beat", 500 * time.Millisecond, 1, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -814,6 +816,39 @@ func TestBatchConsumer_BackoffBeforeDeleteAndHeartbeatKeepsAck(t *testing.T) {
 	time.Sleep(1500 * time.Millisecond)
 	if _, _, _, after, _, _ := f.snapshot(); after != calls {
 		t.Errorf("heartbeat continued after untrack: %d -> %d", calls, after)
+	}
+}
+
+func TestBatchConsumer_ExtendsVisibilityBeforeDelete(t *testing.T) {
+	// Heartbeat one second under Visibility leaves less than AckTimeout when a
+	// handler returns just before the next tick. That combination stays legal:
+	// the delete path extends the receipt first instead of rejecting it.
+	o, err := (Options{Visibility: 30 * time.Second, Heartbeat: 29 * time.Second, AckTimeout: 10 * time.Second}).withDefaults("u")
+	if err != nil {
+		t.Fatalf("Visibility-Heartbeat under AckTimeout must be accepted: %v", err)
+	}
+	if o.Visibility != 30*time.Second || o.Heartbeat != 29*time.Second {
+		t.Fatalf("stored vis=%s heartbeat=%s", o.Visibility, o.Heartbeat)
+	}
+
+	f := newFake(1, nil)
+	started := make(chan struct{})
+	var once sync.Once
+	f.onDelete = func(ctx context.Context) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+	}
+	cancel, done := startBatch(t, f, func(context.Context, []*Record) Result { return Result{} }, Options{
+		Linger: 10 * time.Millisecond, Visibility: 30 * time.Second, Heartbeat: 29 * time.Second, AckTimeout: 300 * time.Millisecond,
+	})
+	defer stopBatch(t, cancel, done)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("delete did not start")
+	}
+	if _, _, vis, calls, _, _ := f.snapshot(); vis["rh-m0"] != 30 || calls < 1 {
+		t.Fatalf("visibility before delete = %d (%d calls), want 30 from the pre-delete extend", vis["rh-m0"], calls)
 	}
 }
 

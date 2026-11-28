@@ -218,8 +218,9 @@ type BatchConsumer struct {
 
 	mu       sync.Mutex
 	inflight map[*Record]struct{}
-	// hbMu is held for a whole heartbeat round and around a RetryAfter
-	// backoff, so the two never interleave.
+	// hbMu is held for a whole heartbeat round, around a RetryAfter backoff,
+	// and around the visibility refresh that precedes a delete, so those
+	// never interleave.
 	hbMu sync.Mutex
 
 	gatesMu sync.Mutex
@@ -476,6 +477,10 @@ func (c *BatchConsumer) process(ctx context.Context, b []*Record) {
 		c.hbMu.Unlock()
 	}
 	if len(ack) > 0 {
+		// A record received just after a tick can have less than AckTimeout of
+		// visibility left when the handler returns. Refresh it before delete so
+		// the receipt cannot become visible (and get received again) mid-ack.
+		c.extendAcks(ctx, ack)
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), c.o.AckTimeout)
 		c.deleteAll(dctx, ack)
 		dcancel()
@@ -658,6 +663,28 @@ func (c *BatchConsumer) failures(b []*Record, res Result) map[string]Failure {
 		}
 	}
 	return failed
+}
+
+// extendAcks sets ack receipts' visibility back to Visibility before delete.
+// It holds hbMu so a heartbeat cannot interleave with the refresh. The lock
+// is not held across the delete itself: acks stay in the heartbeat set until
+// DeleteMessageBatch returns, and a heartbeat during that call is intentional.
+func (c *BatchConsumer) extendAcks(ctx context.Context, recs []*Record) {
+	c.hbMu.Lock()
+	defer c.hbMu.Unlock()
+	vis := int32(c.o.Visibility / time.Second)
+	for chunk := range slices.Chunk(recs, 10) {
+		entries := make([]types.ChangeMessageVisibilityBatchRequestEntry, len(chunk))
+		for i, r := range chunk {
+			entries[i] = types.ChangeMessageVisibilityBatchRequestEntry{
+				Id: aws.String(strconv.Itoa(i)), ReceiptHandle: aws.String(r.ReceiptHandle),
+				VisibilityTimeout: vis,
+			}
+		}
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.o.AckTimeout)
+		c.changeVisibility(cctx, entries, chunk, "ack")
+		cancel()
+	}
 }
 
 func (c *BatchConsumer) deleteAll(ctx context.Context, recs []*Record) {
