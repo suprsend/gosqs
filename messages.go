@@ -48,7 +48,18 @@ func (m *message) MessageId() string {
 // Route returns the event name that is used for routing within a worker, e.g. post_published
 func (m *message) Route() string {
 	return m.route
-	// return *m.MessageAttributes["route"].StringValue
+}
+
+// messageRoute is the route a legacy consumer dispatches on. messageHandlerName
+// wins when it is set; otherwise the message's "route" string attribute is used.
+func messageRoute(m types.Message, messageHandlerName string) string {
+	if messageHandlerName != "" {
+		return messageHandlerName
+	}
+	if attr, ok := m.MessageAttributes["route"]; ok {
+		return aws.ToString(attr.StringValue)
+	}
+	return ""
 }
 
 // Decode will unmarshal the message into a supplied output using json

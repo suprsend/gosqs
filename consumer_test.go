@@ -1,3 +1,5 @@
+//go:build integration
+
 package gosqs
 
 import (
@@ -9,7 +11,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 type testStruct struct {
@@ -43,16 +44,6 @@ func retrieveMessage(t *testing.T, c *consumer) Message {
 	}
 
 	return newMessage(output.Messages[0], messageRoute(output.Messages[0], c.messageHandlerName))
-}
-
-func messageRoute(m types.Message, fallback string) string {
-	if fallback != "" {
-		return fallback
-	}
-	if attr, ok := m.MessageAttributes["route"]; ok {
-		return aws.ToString(attr.StringValue)
-	}
-	return ""
 }
 
 func getConsumer(t *testing.T) *consumer {
@@ -213,8 +204,8 @@ func TestRun(t *testing.T) {
 	t.Run("no_event", func(t *testing.T) {
 		c.Message(context.TODO(), "post-worker", "no_event", testStruct{"val"})
 		m := retrieveMessage(t, c)
-		if err := c.run(m.(*message)); err != nil {
-			t.Errorf("unexpected result, expected %v, got %v", nil, err)
+		if err := c.run(m.(*message)); !isSQSErr(err, ErrNoRoute) {
+			t.Errorf("unexpected result, expected %v, got %v", ErrNoRoute, err)
 		}
 	})
 

@@ -2,6 +2,7 @@ package gosqs
 
 import (
 	"context"
+	"fmt"
 )
 
 const (
@@ -17,12 +18,23 @@ type Handler func(context.Context, Message) error
 type Adapter func(Handler) Handler
 
 // WithRecovery is an adapter that logs a Panic error and recovers the service from a failed state
+//
+// recovery is deferred around the handler and is expected to call recover(). If the handler panics, the wrapped
+// handler returns an error wrapping ErrPanic, so the message is not deleted and is redelivered.
 func WithRecovery(recovery func()) Adapter {
 	return func(fn Handler) Handler {
-		return func(ctx context.Context, m Message) error {
+		return func(ctx context.Context, m Message) (err error) {
+			panicked := true
+			defer func() {
+				if panicked {
+					err = fmt.Errorf("%w: message %s", ErrPanic, m.MessageId())
+				}
+			}()
 			defer recovery()
 
-			return fn(ctx, m)
+			err = fn(ctx, m)
+			panicked = false
+			return err
 		}
 	}
 }
@@ -31,7 +43,8 @@ func WithRecovery(recovery func()) Adapter {
 func WithMiddleware(f func(ctx context.Context, m Message) error) Adapter {
 	return func(fn Handler) Handler {
 		return func(ctx context.Context, m Message) error {
-			f(ctx, m)
+			// The wrapper runs for its side effect. Its error does not stop the handler.
+			_ = f(ctx, m)
 
 			return fn(ctx, m)
 		}

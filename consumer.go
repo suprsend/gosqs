@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -13,6 +14,10 @@ import (
 )
 
 var maxMessages = int32(10)
+
+// defaultWaitTimeSeconds is the ReceiveMessage long-poll wait used when
+// Config.WaitTimeSeconds is unset. 20s is the SQS maximum.
+const defaultWaitTimeSeconds = int32(20)
 
 // Consumer provides an interface for receiving messages through AWS SQS and SNS
 type Consumer interface {
@@ -49,7 +54,6 @@ type consumer struct {
 	Hostname          string
 	VisibilityTimeout int
 	workerPool        int
-	workerCount       int
 	extensionLimit    int
 	attributes        []customAttribute
 
@@ -110,6 +114,9 @@ func NewConsumer(c Config, queueName string) (Consumer, error) {
 		cons.maxNumberOfMessages = int32(c.MaxNumberOfMessages)
 	}
 	cons.waitTimeSeconds = int32(c.WaitTimeSeconds)
+	if cons.waitTimeSeconds == 0 {
+		cons.waitTimeSeconds = defaultWaitTimeSeconds // long polling; 0 would busy-poll an empty queue
+	}
 	return cons, nil
 }
 
@@ -177,7 +184,11 @@ func (c *consumer) Consume(ctx context.Context) {
 				return
 			}
 			c.Logger().Println(ErrGetMessage.Context(err).Error(), "retrying in 10s")
-			time.Sleep(10 * time.Second)
+			if !sleep(ctx, 10*time.Second) {
+				c.Logger().Println("EXITING !! gosqs.consumer.Consume(). Context cancelled.")
+				close(jobs)
+				return
+			}
 			continue
 		}
 
@@ -189,7 +200,7 @@ func (c *consumer) Consume(ctx context.Context) {
 			//     continue
 			// }
 
-			jobs <- newMessage(m, c.messageHandlerName)
+			jobs <- newMessage(m, messageRoute(m, c.messageHandlerName))
 		}
 	}
 }
@@ -204,25 +215,41 @@ func (c *consumer) worker(id int, messages <-chan *message) {
 }
 
 // run should be run within a worker
-
-// if there is no handler for that route, then the message will be deleted and fully consumed
 //
-// if the handler exists, it will wait for the err channel to be processed. Once it receives feedback from the handler in the form
-// of a channel, it will either log the error, or consume the message
+// if there is no handler for that route, the message is not deleted: it reappears after its visibility timeout and
+// reaches the DLQ through the queue's maxReceiveCount
+//
+// while the handler runs, a heartbeat keeps the message invisible. The message is deleted only if the handler returns nil
 func (c *consumer) run(m *message) error {
-	if h, ok := c.handlers[m.Route()]; ok {
-		ctx := context.Background()
-
-		go c.extend(ctx, m)
-		if err := h(ctx, m); err != nil {
-			return m.ErrorResponse(ctx, err)
-		}
-
-		// finish the extension channel if the message was processed successfully
-		m.Success(ctx)
+	h, ok := c.handlers[m.Route()]
+	if !ok {
+		return ErrNoRoute.Context(fmt.Errorf("no handler registered for route %q, message %s not deleted", m.Route(), m.MessageId()))
 	}
+	ctx := context.Background()
 
-	//deletes message if the handler was successful or if there was no handler with that route
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		c.heartbeat(ctx, m, done)
+	}()
+	// Close done on every return, including a panic that escapes the handler,
+	// and wait until the heartbeat goroutine has left so a late extend cannot
+	// race the caller (or a test) observing the message.
+	var once sync.Once
+	stopHeartbeat := func() {
+		once.Do(func() {
+			close(done)
+			<-exited
+		})
+	}
+	defer stopHeartbeat()
+
+	err := h(ctx, m)
+	if err != nil {
+		return err
+	}
+	stopHeartbeat()
 	return c.delete(m) //MESSAGE CONSUMED
 }
 
@@ -292,31 +319,77 @@ func (c *consumer) delete(m *message) error {
 	return nil
 }
 
-func (c *consumer) extend(ctx context.Context, m *message) {
-	var count int
-	extension := int32(c.VisibilityTimeout)
-	for {
-		//only allow 1 extensions (Default 1m30s)
-		if count >= c.extensionLimit {
+// heartbeat keeps m invisible while its handler runs. Every VisibilityTimeout/3
+// it sets visibility back to VisibilityTimeout, until done is closed or the next
+// beat would hold the message past holdBudget (the previous extender's maximum).
+// An extensionLimit of 0 disables it. Each ChangeMessageVisibility call is bounded
+// by heartbeatCallTimeout and is skipped when the handler has already finished.
+func (c *consumer) heartbeat(ctx context.Context, m *message, done <-chan struct{}) {
+	if c.extensionLimit <= 0 || c.VisibilityTimeout <= 0 {
+		return
+	}
+	vt := time.Duration(c.VisibilityTimeout) * time.Second
+	budget := holdBudget(vt, c.extensionLimit)
+	timeout := heartbeatCallTimeout(vt)
+	t := time.NewTicker(vt / 3)
+	defer t.Stop()
+	for beat := 1; ; beat++ {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if beatHoldsPastBudget(beat, vt, budget) {
 			c.Logger().Println(ErrMessageProcessing.Error(), m.Route())
 			return
 		}
-
-		count++
-		// allow 10 seconds to process the extension request
-		time.Sleep(time.Duration(c.VisibilityTimeout-10) * time.Second)
 		select {
-		case <-m.err:
-			// goroutine finished
+		case <-done:
+			return
+		case <-ctx.Done():
 			return
 		default:
-			// double the allowed processing time
-			extension = extension + int32(c.VisibilityTimeout)
-			_, err := c.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{QueueUrl: aws.String(c.QueueURL), ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: extension})
-			if err != nil {
-				c.Logger().Println(ErrUnableToExtend.Error(), err.Error())
-				return
-			}
+		}
+		callCtx, cancel := context.WithTimeout(ctx, timeout)
+		_, err := c.sqs.ChangeMessageVisibility(callCtx, &sqs.ChangeMessageVisibilityInput{
+			QueueUrl:          aws.String(c.QueueURL),
+			ReceiptHandle:     m.ReceiptHandle,
+			VisibilityTimeout: int32(c.VisibilityTimeout),
+		})
+		cancel()
+		if err != nil {
+			c.Logger().Println(ErrUnableToExtend.Error(), err.Error())
 		}
 	}
+}
+
+// holdBudget is how long the previous extender kept a receipt invisible:
+// L*(VT-10)+(L+1)*VT. The old loop slept VT-10 before each extend; a
+// non-positive sleep (VT <= 10) returned immediately, and the final visibility
+// was (L+1)*VT, so the slack is clamped at zero.
+func holdBudget(vt time.Duration, limit int) time.Duration {
+	slack := vt - 10*time.Second
+	if slack < 0 {
+		slack = 0
+	}
+	return time.Duration(limit)*slack + time.Duration(limit+1)*vt
+}
+
+// beatHoldsPastBudget reports whether beat (1-based), scheduled at beat*(VT/3),
+// would push the receipt's visibility deadline past budget.
+func beatHoldsPastBudget(beat int, vt, budget time.Duration) bool {
+	scheduled := time.Duration(beat) * (vt / 3)
+	return scheduled+vt > budget
+}
+
+// heartbeatCallTimeout bounds one extend RPC, including the client's retries,
+// to min(5s, VT/3) so it stays inside the gap before the next beat.
+func heartbeatCallTimeout(vt time.Duration) time.Duration {
+	d := vt / 3
+	if d > 5*time.Second {
+		return 5 * time.Second
+	}
+	return d
 }

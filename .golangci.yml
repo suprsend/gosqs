@@ -1,0 +1,11 @@
+version: "2"
+
+# examples/ is a set of snippets, not a built program. The unused linter
+# reports those entry points; that is accepted and kept out of this run.
+linters:
+  exclusions:
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - ^examples(/|$)
