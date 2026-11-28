@@ -92,20 +92,25 @@ var (
 
 // Options tune the batch consumer. Zero values take the defaults in withDefaults.
 type Options struct {
-	MaxBatch    int           // records per handler call; may exceed 10. Default 10.
-	Linger      time.Duration // flush a partial batch after this. Default 200ms.
-	Workers     int           // concurrent handler calls. Default 4.
-	MaxInFlight int           // received but not yet acked. Default Workers*MaxBatch + MaxBatch.
-	Receivers   int           // concurrent ReceiveMessage loops. Default 1.
+	MaxBatch int // records per handler call; may exceed 10. Default 10.
+	// Linger flushes a partial batch after this. Default 200ms. A value of at
+	// least 1s is stored in whole seconds, the same truncation SQS applies to
+	// Visibility, so the timer cannot outlast the receipt.
+	Linger      time.Duration
+	Workers     int // concurrent handler calls. Default 4.
+	MaxInFlight int // received but not yet acked. Default Workers*MaxBatch + MaxBatch.
+	Receivers   int // concurrent ReceiveMessage loops. Default 1.
 	// WaitTime is the long-poll wait. SQS takes whole seconds in 1..20.
 	// A value in (0, 1s) is rounded up to 1s, because 0 would short-poll.
 	// Default 20s.
 	WaitTime time.Duration
 	// Visibility is set on receive and on each heartbeat. SQS takes whole
-	// seconds in 1..43200 (12h). Default 30s.
+	// seconds in 1..43200 (12h). The stored value is truncated to seconds.
+	// Default 30s.
 	Visibility time.Duration
-	// Heartbeat extends in-flight receipts this often. Compared in whole
-	// seconds, it must be at least 1s under Visibility. Default Visibility/3.
+	// Heartbeat extends in-flight receipts this often. It is stored in whole
+	// seconds, must be at least 1s, and must be at least 1s under Visibility.
+	// Default Visibility/3, raised to 1s when that would be shorter.
 	Heartbeat    time.Duration
 	MaxExtend    time.Duration // stop extending a record this long after receipt. Default 15m.
 	DrainTimeout time.Duration // after ctx is done, wait this long before cancelling handlers. Default 30s.
@@ -129,6 +134,7 @@ func (o Options) withDefaults(queueURL string) (Options, error) {
 	def(&o.Workers, 4)
 	def(&o.Receivers, 1)
 	def(&o.MaxInFlight, o.Workers*o.MaxBatch+o.MaxBatch)
+	heartbeatSet := o.Heartbeat > 0
 	defD(&o.Linger, 200*time.Millisecond)
 	defD(&o.WaitTime, 20*time.Second)
 	defD(&o.Visibility, 30*time.Second)
@@ -136,6 +142,11 @@ func (o Options) withDefaults(queueURL string) (Options, error) {
 	defD(&o.MaxExtend, 15*time.Minute)
 	defD(&o.DrainTimeout, 30*time.Second)
 	defD(&o.AckTimeout, 10*time.Second)
+	// A computed default under a second would fail the check below. Callers
+	// who set Heartbeat themselves still get that error.
+	if !heartbeatSet && o.Heartbeat < time.Second {
+		o.Heartbeat = time.Second
+	}
 	// Truncate after defaults so a sub-second WaitTime cannot become a short poll.
 	if o.WaitTime < time.Second {
 		o.WaitTime = time.Second
@@ -146,6 +157,11 @@ func (o Options) withDefaults(queueURL string) (Options, error) {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
+	// SQS applies Visibility in whole seconds, and the heartbeat period is
+	// compared the same way. Store those truncated values so the ticker and
+	// the queue timeout cannot drift back together. Linger of at least one
+	// second is stored the same way; a sub-second linger is a local flush
+	// delay (the default is 200ms) and stays as given.
 	waitSec := int64(o.WaitTime / time.Second)
 	visSec := int64(o.Visibility / time.Second)
 	hbSec := int64(o.Heartbeat / time.Second)
@@ -156,12 +172,20 @@ func (o Options) withDefaults(queueURL string) (Options, error) {
 		return o, fmt.Errorf("gosqs: WaitTime %v is %ds after truncation, want 1..20", o.WaitTime, waitSec)
 	case visSec < 1 || visSec > 12*60*60:
 		return o, fmt.Errorf("gosqs: Visibility %v is %ds after truncation, want 1..43200", o.Visibility, visSec)
+	case hbSec < 1:
+		return o, fmt.Errorf("gosqs: Heartbeat %v is %ds after truncation, want at least 1s", o.Heartbeat, hbSec)
 	case hbSec >= visSec:
 		return o, fmt.Errorf("gosqs: Heartbeat %v (%ds) must be at least 1s under Visibility %v (%ds)", o.Heartbeat, hbSec, o.Visibility, visSec)
-	case o.Linger >= o.Visibility:
-		return o, fmt.Errorf("gosqs: Linger %v must be well under Visibility %v", o.Linger, o.Visibility)
 	case o.MaxInFlight < o.MaxBatch:
 		return o, fmt.Errorf("gosqs: MaxInFlight %d < MaxBatch %d would never fill a batch", o.MaxInFlight, o.MaxBatch)
+	}
+	o.Visibility = time.Duration(visSec) * time.Second
+	o.Heartbeat = time.Duration(hbSec) * time.Second
+	if o.Linger >= time.Second {
+		o.Linger = time.Duration(o.Linger/time.Second) * time.Second
+	}
+	if o.Linger >= o.Visibility {
+		return o, fmt.Errorf("gosqs: Linger %v must be well under Visibility %v", o.Linger, o.Visibility)
 	}
 	return o, nil
 }

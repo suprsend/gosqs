@@ -428,23 +428,33 @@ func TestBatchConsumer_LegacyHandlerViaPerMessage(t *testing.T) {
 
 func TestOptions_Validation(t *testing.T) {
 	tests := []struct {
-		name string
-		url  string
-		o    Options
-		ok   bool
+		name       string
+		url        string
+		o          Options
+		ok         bool
+		visibility time.Duration
+		heartbeat  time.Duration
+		linger     time.Duration
 	}{
-		{"defaults", "u", Options{}, true},
-		{"empty url", "", Options{}, false},
-		{"wait > 20s", "u", Options{WaitTime: 21 * time.Second}, false},
-		{"wait 20.9s truncates into range", "u", Options{WaitTime: 20*time.Second + 900*time.Millisecond}, true},
-		{"sub-second wait rounds up", "u", Options{WaitTime: 500 * time.Millisecond}, true},
-		{"heartbeat seconds collide after truncation", "u", Options{Visibility: 10*time.Second + 500*time.Millisecond, Heartbeat: 10 * time.Second}, false},
-		{"heartbeat one second under truncated visibility", "u", Options{Visibility: 10*time.Second + 500*time.Millisecond, Heartbeat: 9 * time.Second}, true},
-		{"visibility over 12h", "u", Options{Visibility: 12*time.Hour + time.Second}, false},
-		{"visibility exactly 12h", "u", Options{Visibility: 12 * time.Hour}, true},
-		{"sub-second visibility", "u", Options{Visibility: 500 * time.Millisecond}, false},
-		{"linger >= visibility", "u", Options{Visibility: 2 * time.Second, Heartbeat: time.Second, Linger: 3 * time.Second}, false},
-		{"fifo from url", "https://x/q.fifo", Options{}, true},
+		{"defaults", "u", Options{}, true, 30 * time.Second, 10 * time.Second, 200 * time.Millisecond},
+		{"empty url", "", Options{}, false, 0, 0, 0},
+		{"wait > 20s", "u", Options{WaitTime: 21 * time.Second}, false, 0, 0, 0},
+		{"wait 20.9s truncates into range", "u", Options{WaitTime: 20*time.Second + 900*time.Millisecond}, true, 0, 0, 0},
+		{"sub-second wait rounds up", "u", Options{WaitTime: 500 * time.Millisecond}, true, 0, 0, 0},
+		{"heartbeat seconds collide after truncation", "u", Options{Visibility: 10*time.Second + 500*time.Millisecond, Heartbeat: 10 * time.Second}, false, 0, 0, 0},
+		{"heartbeat one second under truncated visibility", "u", Options{Visibility: 10*time.Second + 500*time.Millisecond, Heartbeat: 9 * time.Second}, true, 10 * time.Second, 9 * time.Second, 0},
+		{"sub-second gap is stored as whole seconds", "u", Options{Visibility: 10100 * time.Millisecond, Heartbeat: 9900 * time.Millisecond}, true, 10 * time.Second, 9 * time.Second, 0},
+		{"heartbeat under 1s", "u", Options{Visibility: 30 * time.Second, Heartbeat: time.Millisecond}, false, 0, 0, 0},
+		{"heartbeat truncates under 1s", "u", Options{Visibility: 30 * time.Second, Heartbeat: 999 * time.Millisecond}, false, 0, 0, 0},
+		{"short visibility raises a default heartbeat to 1s", "u", Options{Visibility: 2 * time.Second}, true, 2 * time.Second, time.Second, 0},
+		{"visibility over 12h", "u", Options{Visibility: 12*time.Hour + time.Second}, false, 0, 0, 0},
+		{"visibility exactly 12h", "u", Options{Visibility: 12 * time.Hour}, true, 0, 0, 0},
+		{"sub-second visibility", "u", Options{Visibility: 500 * time.Millisecond}, false, 0, 0, 0},
+		{"linger >= visibility", "u", Options{Visibility: 2 * time.Second, Heartbeat: time.Second, Linger: 3 * time.Second}, false, 0, 0, 0},
+		{"linger matches truncated visibility", "u", Options{Visibility: 10500 * time.Millisecond, Heartbeat: time.Second, Linger: 10 * time.Second}, false, 0, 0, 0},
+		{"multi-second linger is stored truncated", "u", Options{Visibility: 30 * time.Second, Heartbeat: time.Second, Linger: 1500 * time.Millisecond}, true, 30 * time.Second, time.Second, time.Second},
+		{"sub-second linger is kept", "u", Options{Linger: 200 * time.Millisecond}, true, 0, 0, 200 * time.Millisecond},
+		{"fifo from url", "https://x/q.fifo", Options{}, true, 0, 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -452,11 +462,23 @@ func TestOptions_Validation(t *testing.T) {
 			if (err == nil) != tt.ok {
 				t.Fatalf("err = %v, want ok=%v", err, tt.ok)
 			}
-			if tt.ok && *o.FIFO != (tt.url == "https://x/q.fifo") {
+			if !tt.ok {
+				return
+			}
+			if *o.FIFO != (tt.url == "https://x/q.fifo") {
 				t.Errorf("FIFO = %v", *o.FIFO)
 			}
-			if tt.ok && tt.o.WaitTime > 0 && tt.o.WaitTime < time.Second && o.WaitTime != time.Second {
+			if tt.o.WaitTime > 0 && tt.o.WaitTime < time.Second && o.WaitTime != time.Second {
 				t.Errorf("WaitTime = %v, want 1s after round-up", o.WaitTime)
+			}
+			if tt.visibility != 0 && o.Visibility != tt.visibility {
+				t.Errorf("Visibility = %v, want %v", o.Visibility, tt.visibility)
+			}
+			if tt.heartbeat != 0 && o.Heartbeat != tt.heartbeat {
+				t.Errorf("Heartbeat = %v, want %v", o.Heartbeat, tt.heartbeat)
+			}
+			if tt.linger != 0 && o.Linger != tt.linger {
+				t.Errorf("Linger = %v, want %v", o.Linger, tt.linger)
 			}
 		})
 	}
