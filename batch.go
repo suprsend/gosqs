@@ -674,7 +674,7 @@ func (c *BatchConsumer) deleteAll(ctx context.Context, recs []*Record) {
 				c.o.Logger.Error("gosqs: delete batch failed", "err", err, "n", len(entries))
 				continue
 			}
-			entries = filterEntries(entries, c.retryableIDs(out.Failed))
+			entries = filterEntries(entries, c.retryableIDs(out.Failed, chunk))
 		}
 		if len(entries) > 0 {
 			c.o.Logger.Error("gosqs: records not deleted, will be redelivered", "n", len(entries))
@@ -683,12 +683,19 @@ func (c *BatchConsumer) deleteAll(ctx context.Context, recs []*Record) {
 }
 
 // retryableIDs logs sender-fault entries and returns the ids worth one retry.
-func (c *BatchConsumer) retryableIDs(failed []types.BatchResultErrorEntry) map[string]bool {
+// recs is the batch the entry ids were assigned from (index i has id "i");
+// the entry id is logged only as a secondary field.
+func (c *BatchConsumer) retryableIDs(failed []types.BatchResultErrorEntry, recs []*Record) map[string]bool {
 	again := make(map[string]bool, len(failed))
 	for _, f := range failed {
 		id := aws.ToString(f.Id)
 		if f.SenderFault { // e.g. ReceiptHandleIsInvalid: retrying cannot help
+			msgID, receipt := "", ""
+			if i, err := strconv.Atoi(id); err == nil && i >= 0 && i < len(recs) {
+				msgID, receipt = recs[i].ID, recs[i].ReceiptHandle
+			}
 			c.o.Logger.Warn("gosqs: skipping sender-fault batch entry",
+				"message_id", msgID, "receipt_handle", receipt,
 				"id", id, "code", aws.ToString(f.Code), "message", aws.ToString(f.Message))
 			continue
 		}
@@ -714,19 +721,22 @@ func (c *BatchConsumer) backoffAll(ctx context.Context, b []*Record, fs []Failur
 	}
 	for chunk := range slices.Chunk(fs, 10) {
 		entries := make([]types.ChangeMessageVisibilityBatchRequestEntry, len(chunk))
+		recs := make([]*Record, len(chunk))
 		for i, f := range chunk {
+			recs[i] = byID[f.ID]
 			entries[i] = types.ChangeMessageVisibilityBatchRequestEntry{
-				Id: aws.String(strconv.Itoa(i)), ReceiptHandle: aws.String(byID[f.ID].ReceiptHandle),
+				Id: aws.String(strconv.Itoa(i)), ReceiptHandle: aws.String(recs[i].ReceiptHandle),
 				VisibilityTimeout: visibilitySeconds(f.RetryAfter),
 			}
 		}
-		c.changeVisibility(ctx, entries, "backoff")
+		c.changeVisibility(ctx, entries, recs, "backoff")
 	}
 }
 
 // changeVisibility sends one visibility batch and retries entries whose failure
 // is not the caller's fault a single time. Sender-fault entries are logged.
-func (c *BatchConsumer) changeVisibility(ctx context.Context, entries []types.ChangeMessageVisibilityBatchRequestEntry, op string) {
+// recs[i] is the record entries were built from under id "i".
+func (c *BatchConsumer) changeVisibility(ctx context.Context, entries []types.ChangeMessageVisibilityBatchRequestEntry, recs []*Record, op string) {
 	for attempt := 0; attempt < 2 && len(entries) > 0; attempt++ {
 		if ctx.Err() != nil {
 			return
@@ -744,7 +754,7 @@ func (c *BatchConsumer) changeVisibility(ctx context.Context, entries []types.Ch
 		if out != nil {
 			failed = out.Failed
 		}
-		entries = filterVisibility(entries, c.retryableIDs(failed))
+		entries = filterVisibility(entries, c.retryableIDs(failed, recs))
 	}
 	if len(entries) > 0 && ctx.Err() == nil {
 		c.o.Logger.Warn("gosqs: "+op+" entries left unchanged", "n", len(entries))
@@ -797,7 +807,7 @@ func (c *BatchConsumer) extendInFlight(ctx context.Context) {
 			}
 		}
 		cctx, cancel := context.WithTimeout(ctx, c.o.AckTimeout)
-		c.changeVisibility(cctx, entries, "heartbeat")
+		c.changeVisibility(cctx, entries, chunk, "heartbeat")
 		cancel()
 	}
 }

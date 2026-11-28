@@ -330,8 +330,8 @@ func TestBatchConsumer_DeleteRetriesOnlyRetryableEntries(t *testing.T) {
 	if want := []int{3, 1}; !slices.Equal(calls, want) {
 		t.Errorf("DeleteMessageBatch entries per call = %v, want %v (retry only the non-sender-fault entry)", calls, want)
 	}
-	if got := logs.String(); !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
-		t.Errorf("sender-fault delete was not logged with id/code/message: %s", got)
+	if got := logs.String(); !strings.Contains(got, "message_id=m1") || !strings.Contains(got, "receipt_handle=rh-m1") || !strings.Contains(got, "id=1") || !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
+		t.Errorf("sender-fault delete was not logged with message id, receipt, id, code, message: %s", got)
 	}
 }
 
@@ -667,8 +667,8 @@ func TestBatchConsumer_VisibilityEntryFailures(t *testing.T) {
 		if _, _, vis, _, _, _ := f.snapshot(); vis["rh-m0"] != 5 {
 			t.Errorf("visibility[rh-m0] = %d, want 5 after retry", vis["rh-m0"])
 		}
-		if got := logs.String(); !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
-			t.Errorf("sender-fault heartbeat entry not logged: %s", got)
+		if got := logs.String(); !strings.Contains(got, "message_id=m1") || !strings.Contains(got, "receipt_handle=rh-m1") || !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
+			t.Errorf("sender-fault heartbeat entry not logged with message id and receipt: %s", got)
 		}
 	})
 
@@ -705,8 +705,8 @@ func TestBatchConsumer_VisibilityEntryFailures(t *testing.T) {
 		if _, _, vis, _, _, _ := f.snapshot(); vis["rh-m0"] != 0 {
 			t.Errorf("visibility = %d, want unset", vis["rh-m0"])
 		}
-		if got := logs.String(); !strings.Contains(got, "id=0") || !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
-			t.Errorf("sender-fault backoff not logged with id, code, message: %s", got)
+		if got := logs.String(); !strings.Contains(got, "message_id=m0") || !strings.Contains(got, "receipt_handle=rh-m0") || !strings.Contains(got, "id=0") || !strings.Contains(got, "ReceiptHandleIsInvalid") || !strings.Contains(got, "bad receipt") {
+			t.Errorf("sender-fault backoff not logged with message id, receipt, id, code, message: %s", got)
 		}
 	})
 }
