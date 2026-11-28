@@ -319,11 +319,20 @@ func (c *consumer) delete(m *message) error {
 	return nil
 }
 
+// heartbeatSkew absorbs timer delay on a beat the nominal schedule accepts.
+// The last off-grid beat is aimed this early so a late wake still satisfies
+// time.Since(start)+vt <= budget.
+const heartbeatSkew = 500 * time.Millisecond
+
 // heartbeat keeps m invisible while its handler runs. Every VisibilityTimeout/3
-// it sets visibility back to VisibilityTimeout, until done is closed or the next
-// beat would hold the message past holdBudget (the previous extender's maximum).
-// An extensionLimit of 0 disables it. Each ChangeMessageVisibility call is bounded
-// by heartbeatCallTimeout and is skipped when the handler has already finished.
+// it sets visibility back to VisibilityTimeout. A beat is refused when time
+// since this heartbeat started plus one visibility would pass holdBudget (the
+// previous extender's maximum). When that interval would stop short of the
+// budget, one last beat is taken at budget-VisibilityTimeout. An extensionLimit
+// of 0 disables it. Each ChangeMessageVisibility call is bounded by
+// heartbeatCallTimeout and is skipped when the handler has already finished.
+// A handler should return at least one visibility before the budget so the
+// delete still fits inside the hold.
 func (c *consumer) heartbeat(ctx context.Context, m *message, done <-chan struct{}) {
 	if c.extensionLimit <= 0 || c.VisibilityTimeout <= 0 {
 		return
@@ -331,17 +340,23 @@ func (c *consumer) heartbeat(ctx context.Context, m *message, done <-chan struct
 	vt := time.Duration(c.VisibilityTimeout) * time.Second
 	budget := holdBudget(vt, c.extensionLimit)
 	timeout := heartbeatCallTimeout(vt)
-	t := time.NewTicker(vt / 3)
-	defer t.Stop()
-	for beat := 1; ; beat++ {
+	interval := vt / 3
+	if interval <= 0 {
+		return
+	}
+	start := time.Now()
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	nextGrid := interval
+	for {
 		select {
 		case <-done:
 			return
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-timer.C:
 		}
-		if beatHoldsPastBudget(beat, vt, budget) {
+		if time.Since(start)+vt > budget+heartbeatSkew {
 			c.Logger().Println(ErrMessageProcessing.Error(), m.Route())
 			return
 		}
@@ -362,7 +377,58 @@ func (c *consumer) heartbeat(ctx context.Context, m *message, done <-chan struct
 		if err != nil {
 			c.Logger().Println(ErrUnableToExtend.Error(), err.Error())
 		}
+		nextGrid += interval
+		wait, ok := nextHeartbeatDelay(time.Since(start), nextGrid, vt, budget, heartbeatSkew)
+		if !ok {
+			c.waitOutBudget(m, start, budget, done, ctx)
+			return
+		}
+		timer.Reset(wait)
 	}
+}
+
+// nextHeartbeatDelay is the wait after a beat at elapsed (time since start).
+// gridNext is the following VisibilityTimeout/3 point. When that point would
+// hold the receipt past budget, the wait lands on the last instant that still
+// fits, skew early so a late timer is still inside the budget.
+func nextHeartbeatDelay(elapsed, gridNext, vt, budget, skew time.Duration) (wait time.Duration, ok bool) {
+	if !beatHoldsPastBudget(gridNext, vt, budget) {
+		wait = gridNext - elapsed
+		if wait < 0 {
+			wait = 0
+		}
+		return wait, true
+	}
+	last := budget - vt - skew
+	if last <= elapsed {
+		return 0, false
+	}
+	return last - elapsed, true
+}
+
+// waitOutBudget blocks until the hold budget or until the handler finishes.
+// The "still processing" log is only for a handler that outlives the budget.
+func (c *consumer) waitOutBudget(m *message, start time.Time, budget time.Duration, done <-chan struct{}, ctx context.Context) {
+	remain := budget - time.Since(start)
+	if remain > 0 {
+		t := time.NewTimer(remain)
+		defer t.Stop()
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+		return
+	default:
+	}
+	c.Logger().Println(ErrMessageProcessing.Error(), m.Route())
 }
 
 // holdBudget is how long the previous extender kept a receipt invisible:
@@ -377,11 +443,10 @@ func holdBudget(vt time.Duration, limit int) time.Duration {
 	return time.Duration(limit)*slack + time.Duration(limit+1)*vt
 }
 
-// beatHoldsPastBudget reports whether beat (1-based), scheduled at beat*(VT/3),
-// would push the receipt's visibility deadline past budget.
-func beatHoldsPastBudget(beat int, vt, budget time.Duration) bool {
-	scheduled := time.Duration(beat) * (vt / 3)
-	return scheduled+vt > budget
+// beatHoldsPastBudget reports whether a beat at elapsed (time since the
+// heartbeat started) would push the receipt's visibility deadline past budget.
+func beatHoldsPastBudget(elapsed, vt, budget time.Duration) bool {
+	return elapsed+vt > budget
 }
 
 // heartbeatCallTimeout bounds one extend RPC, including the client's retries,

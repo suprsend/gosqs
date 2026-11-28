@@ -253,13 +253,7 @@ func TestHoldBudget(t *testing.T) {
 	if got := holdBudget(vt, 2); got != 130*time.Second {
 		t.Fatalf("budget = %v, want 130s", got)
 	}
-	var beats []time.Duration
-	for beat := 1; !beatHoldsPastBudget(beat, vt, 130*time.Second); beat++ {
-		beats = append(beats, time.Duration(beat)*(vt/3))
-		if beat > 20 {
-			t.Fatal("beat loop did not stop")
-		}
-	}
+	beats := gridBeats(vt, 130*time.Second)
 	if len(beats) != 10 || beats[0] != 10*time.Second || beats[len(beats)-1] != 100*time.Second {
 		t.Fatalf("allowed beats = %v, want 10s..100s", beats)
 	}
@@ -270,24 +264,42 @@ func TestHoldBudget(t *testing.T) {
 	if got := holdBudget(time.Second, 1); got != 2*time.Second {
 		t.Errorf("VT=1 L=1 budget = %v, want 2s", got)
 	}
-	n := 0
-	for beat := 1; !beatHoldsPastBudget(beat, time.Second, holdBudget(time.Second, 1)); beat++ {
-		n++
-		if beat > 10 {
-			break
-		}
-	}
-	if n != 3 {
+	if n := len(gridBeats(time.Second, holdBudget(time.Second, 1))); n != 3 {
 		t.Errorf("VT=1 L=1 allows %d beats, want 3", n)
 	}
 	// The shortest VT that beats once more than the old 3*L cap (L=1 => 3).
 	vt = 15 * time.Second
-	n = 0
-	for beat := 1; !beatHoldsPastBudget(beat, vt, holdBudget(vt, 1)); beat++ {
-		n++
-	}
-	if n != 4 {
+	if n := len(gridBeats(vt, holdBudget(vt, 1))); n != 4 {
 		t.Errorf("VT=15 L=1 allows %d beats, want 4", n)
+	}
+	// VT=14 L=1: the old sleeper held until 32s. A VT/3 grid last accepts a
+	// beat at 14s, which lapses at 28s. The off-grid beat reaches the budget.
+	vt = 14 * time.Second
+	budget := holdBudget(vt, 1)
+	if budget != 32*time.Second {
+		t.Fatalf("VT=14 L=1 budget = %v, want 32s", budget)
+	}
+	grid := gridBeats(vt, budget)
+	if len(grid) == 0 || grid[len(grid)-1]+vt >= budget-time.Second {
+		t.Fatalf("grid beats %v already reach budget %v", grid, budget)
+	}
+	elapsed := time.Duration(0)
+	next := vt / 3
+	var taken []time.Duration
+	for range 8 {
+		wait, ok := nextHeartbeatDelay(elapsed, next, vt, budget, heartbeatSkew)
+		if !ok {
+			break
+		}
+		elapsed += wait
+		taken = append(taken, elapsed)
+		next += vt / 3
+	}
+	if len(taken) != len(grid)+1 {
+		t.Fatalf("scheduled beats = %v, want the grid plus one beat at the budget", taken)
+	}
+	if end := taken[len(taken)-1] + vt; end < budget-heartbeatSkew || end > budget {
+		t.Fatalf("invisibility ends at %v, want %v", end, budget)
 	}
 	if heartbeatCallTimeout(30*time.Second) != 5*time.Second {
 		t.Errorf("timeout(30s) = %v, want 5s", heartbeatCallTimeout(30*time.Second))
@@ -298,6 +310,19 @@ func TestHoldBudget(t *testing.T) {
 	if heartbeatCallTimeout(time.Second) != time.Second/3 {
 		t.Errorf("timeout(1s) = %v, want VT/3", heartbeatCallTimeout(time.Second))
 	}
+}
+
+// gridBeats lists the VisibilityTimeout/3 instants that still fit in budget.
+func gridBeats(vt, budget time.Duration) []time.Duration {
+	var beats []time.Duration
+	for beat := 1; beat < 30; beat++ {
+		at := time.Duration(beat) * (vt / 3)
+		if beatHoldsPastBudget(at, vt, budget) {
+			break
+		}
+		beats = append(beats, at)
+	}
+	return beats
 }
 
 func TestConsumerRun_HeartbeatRespectsOldBudget(t *testing.T) {
@@ -321,6 +346,33 @@ func TestConsumerRun_HeartbeatRespectsOldBudget(t *testing.T) {
 	for _, v := range srv.visibility {
 		if v != 15 {
 			t.Errorf("VisibilityTimeout = %d, want 15", v)
+		}
+	}
+}
+
+func TestConsumerRun_ShortVisibilityReachesOldBudget(t *testing.T) {
+	// VT=14 L=1. The old sleeper woke at 4s and set visibility to 28s, so the
+	// receipt stayed invisible until t=32s. The VT/3 grid's last accepted beat
+	// is at 14s and would lapse at 28s, leaving a 30s handler outside the hold.
+	// The elapsed-time stop takes one more beat so the handler is still inside.
+	t.Parallel()
+	srv, client, url := newSQSServer(t)
+	c := newLegacyConsumer(client, url, 14, 1)
+	c.RegisterHandler("route", func(context.Context, Message) error {
+		time.Sleep(22 * time.Second)
+		return nil
+	})
+	if err := c.run(testMessage("route")); err != nil {
+		t.Fatalf("run() err = %v", err)
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if n := len(srv.visibility); n != 4 {
+		t.Errorf("ChangeMessageVisibility calls = %d, want 4 (the grid alone stops at 3)", n)
+	}
+	for _, v := range srv.visibility {
+		if v != 14 {
+			t.Errorf("VisibilityTimeout = %d, want 14", v)
 		}
 	}
 }
