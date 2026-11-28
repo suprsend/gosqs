@@ -88,6 +88,9 @@ var (
 	ErrUnknownID    = errors.New("gosqs: handler reported an id not in the batch")
 	ErrGroupBlocked = errors.New("gosqs: earlier message in the FIFO group failed")
 	ErrDecode       = errors.New("gosqs: decode failed")
+	// errNotDeleted is recorded against a receipt DeleteMessageBatch did not
+	// remove, so the FIFO gate holds the rest of the group. It stays heartbeated.
+	errNotDeleted = errors.New("gosqs: delete failed")
 )
 
 // Options tune the batch consumer. Zero values take the defaults in withDefaults.
@@ -482,9 +485,23 @@ func (c *BatchConsumer) process(ctx context.Context, b []*Record) {
 		// the receipt cannot become visible (and get received again) mid-ack.
 		c.extendAcks(ctx, ack)
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), c.o.AckTimeout)
-		c.deleteAll(dctx, ack)
+		undeleted := c.deleteAll(dctx, ack)
 		dcancel()
-		c.untrack(ack)
+		// A failed delete is a group failure: finishGroups (via the defer) must
+		// see it before the next batch of the group is released. Leave those
+		// receipts heartbeated so the head cannot be redelivered behind the tail.
+		missed := make(map[string]struct{}, len(undeleted))
+		for _, r := range undeleted {
+			missed[r.ID] = struct{}{}
+			failed[r.ID] = Failure{ID: r.ID, Err: errNotDeleted}
+		}
+		var gone []*Record
+		for _, r := range ack {
+			if _, ok := missed[r.ID]; !ok {
+				gone = append(gone, r)
+			}
+		}
+		c.untrack(gone)
 	}
 	c.o.Logger.Debug("gosqs: batch done", "size", len(b), "acked", len(ack),
 		"failed", len(failed), "took", time.Since(start))
@@ -687,26 +704,86 @@ func (c *BatchConsumer) extendAcks(ctx context.Context, recs []*Record) {
 	}
 }
 
-func (c *BatchConsumer) deleteAll(ctx context.Context, recs []*Record) {
-	for chunk := range slices.Chunk(recs, 10) {
-		entries := make([]types.DeleteMessageBatchRequestEntry, len(chunk))
-		for i, r := range chunk {
-			entries[i] = types.DeleteMessageBatchRequestEntry{Id: aws.String(strconv.Itoa(i)), ReceiptHandle: aws.String(r.ReceiptHandle)}
+// deleteAll deletes recs and returns the receipts still on the queue.
+// For one FIFO group, a later receipt is not sent until every earlier receipt
+// in recs has been deleted. A single DeleteMessageBatch can still delete a
+// later entry and fail an earlier one; holding the next call is what keeps
+// that split from crossing batches.
+func (c *BatchConsumer) deleteAll(ctx context.Context, recs []*Record) []*Record {
+	pending := slices.Clone(recs)
+	var undeleted []*Record
+	for len(pending) > 0 {
+		if ctx.Err() != nil {
+			return append(undeleted, pending...)
 		}
-		// One retry for the whole call and for retryable per-entry failures.
-		// Sender-fault entries are logged and dropped; retrying cannot help.
-		for attempt := 0; attempt < 2 && len(entries) > 0; attempt++ {
-			out, err := c.api.DeleteMessageBatch(ctx, &sqs.DeleteMessageBatchInput{QueueUrl: aws.String(c.url), Entries: entries})
-			if err != nil {
-				c.o.Logger.Error("gosqs: delete batch failed", "err", err, "n", len(entries))
+		n := min(len(pending), 10)
+		wave := pending[:n]
+		pending = pending[n:]
+		failed := c.deleteChunk(ctx, wave)
+		if len(failed) == 0 {
+			continue
+		}
+		groupBad := map[string]struct{}{}
+		for _, r := range failed {
+			undeleted = append(undeleted, r)
+			if c.fifo() && r.GroupID != "" {
+				groupBad[r.GroupID] = struct{}{}
+			}
+		}
+		if len(groupBad) == 0 {
+			continue
+		}
+		var rest []*Record
+		for _, r := range pending {
+			if _, bad := groupBad[r.GroupID]; bad {
+				undeleted = append(undeleted, r)
 				continue
 			}
-			entries = filterEntries(entries, c.retryableIDs(out.Failed, chunk))
+			rest = append(rest, r)
 		}
-		if len(entries) > 0 {
-			c.o.Logger.Error("gosqs: records not deleted, will be redelivered", "n", len(entries))
-		}
+		pending = rest
 	}
+	return undeleted
+}
+
+// deleteChunk deletes one batch of at most 10. It returns the receipts that
+// are still on the queue after one retry of the call and of retryable entries.
+func (c *BatchConsumer) deleteChunk(ctx context.Context, chunk []*Record) []*Record {
+	entries := make([]types.DeleteMessageBatchRequestEntry, len(chunk))
+	left := make(map[string]bool, len(chunk))
+	for i, r := range chunk {
+		id := strconv.Itoa(i)
+		entries[i] = types.DeleteMessageBatchRequestEntry{Id: aws.String(id), ReceiptHandle: aws.String(r.ReceiptHandle)}
+		left[id] = true
+	}
+	// One retry for the whole call and for retryable per-entry failures.
+	// Sender-fault entries are logged and dropped; retrying cannot help.
+	for attempt := 0; attempt < 2 && len(entries) > 0; attempt++ {
+		out, err := c.api.DeleteMessageBatch(ctx, &sqs.DeleteMessageBatchInput{QueueUrl: aws.String(c.url), Entries: entries})
+		if err != nil {
+			c.o.Logger.Error("gosqs: delete batch failed", "err", err, "n", len(entries))
+			continue
+		}
+		failedID := make(map[string]bool, len(out.Failed))
+		for _, f := range out.Failed {
+			failedID[aws.ToString(f.Id)] = true
+		}
+		for _, e := range entries {
+			if !failedID[aws.ToString(e.Id)] {
+				delete(left, aws.ToString(e.Id))
+			}
+		}
+		entries = filterEntries(entries, c.retryableIDs(out.Failed, chunk))
+	}
+	if len(entries) > 0 {
+		c.o.Logger.Error("gosqs: records not deleted, will be redelivered", "n", len(entries))
+	}
+	undeleted := make([]*Record, 0, len(left))
+	for id := range left {
+		i, _ := strconv.Atoi(id)
+		undeleted = append(undeleted, chunk[i])
+	}
+	return undeleted
 }
 
 // retryableIDs logs sender-fault entries and returns the ids worth one retry.

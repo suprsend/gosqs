@@ -871,3 +871,161 @@ func TestBatchConsumer_DeleteHasOwnAckTimeout(t *testing.T) {
 		t.Errorf("deleted = %v, want %v (delete must not share backoff's expired context)", deleted, want)
 	}
 }
+
+func TestBatchConsumer_DeleteFailureHoldsFIFOTail(t *testing.T) {
+	fifo := func(maxBatch, workers int, ack time.Duration) Options {
+		return Options{
+			MaxBatch: maxBatch, Workers: workers, Linger: 300 * time.Millisecond, FIFO: aws.Bool(true),
+			Heartbeat: time.Second, Visibility: 30 * time.Second, AckTimeout: ack,
+		}
+	}
+	// headTail runs m0 then m1 as separate batches. The handler succeeds for
+	// both; only a delete failure on m0 may stop m1. The consumer stays up so
+	// the caller can see whether the failed receipt is still heartbeated.
+	headTail := func(t *testing.T, f *fakeSQS, o Options) (handled []string, cancel func(), done <-chan struct{}) {
+		t.Helper()
+		var mu sync.Mutex
+		var got []string
+		h := func(_ context.Context, recs []*Record) Result {
+			mu.Lock()
+			got = append(got, ids(recs)...)
+			mu.Unlock()
+			if len(recs) > 0 && recs[0].ID == "m0" {
+				time.Sleep(150 * time.Millisecond) // let the other worker reach the gate
+			}
+			return Result{}
+		}
+		cancel, done = startBatch(t, f, h, o)
+		if !waitUntil(t, 3*time.Second, func() bool {
+			_, calls, _, _, _, _ := f.snapshot()
+			return len(calls) >= 1
+		}) {
+			stopBatch(t, cancel, done)
+			t.Fatal("head delete was not attempted")
+		}
+		time.Sleep(300 * time.Millisecond) // a released tail would be deleted within this
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), got...), cancel, done
+	}
+	stillBeating := func(t *testing.T, f *fakeSQS) {
+		t.Helper()
+		n := f.visAttempt("rh-m0")
+		if n < 1 {
+			t.Fatal("head visibility was not extended")
+		}
+		time.Sleep(1300 * time.Millisecond)
+		if got := f.visAttempt("rh-m0"); got <= n {
+			t.Errorf("stopped heartbeating a failed delete: %d -> %d", n, got)
+		}
+	}
+
+	t.Run("transport error on the head", func(t *testing.T) {
+		f := newFake(2, func(int) string { return "g" })
+		f.failDeleteReceipt = "rh-m0"
+		handled, cancel, done := headTail(t, f, fifo(1, 2, time.Second))
+		defer stopBatch(t, cancel, done)
+		if !slices.Equal(handled, []string{"m0"}) {
+			t.Errorf("handler saw %v, want [m0]", handled)
+		}
+		deleted, calls, vis, _, _, _ := f.snapshot()
+		if len(deleted) != 0 {
+			t.Errorf("deleted = %v, want none", deleted)
+		}
+		if len(calls) < 2 {
+			t.Errorf("delete calls = %v, want two failed attempts and no tail call", calls)
+		}
+		if vis["rh-m0"] != 30 {
+			t.Errorf("head visibility = %d, want 30", vis["rh-m0"])
+		}
+		stillBeating(t, f)
+	})
+
+	t.Run("ack timeout on the head", func(t *testing.T) {
+		f := newFake(2, func(int) string { return "g" })
+		f.hangDelete = "rh-m0"
+		handled, cancel, done := headTail(t, f, fifo(1, 2, 200*time.Millisecond))
+		defer stopBatch(t, cancel, done)
+		if !slices.Equal(handled, []string{"m0"}) {
+			t.Errorf("handler saw %v, want [m0]", handled)
+		}
+		if deleted, _, _, _, _, _ := f.snapshot(); len(deleted) != 0 {
+			t.Errorf("deleted = %v, want none", deleted)
+		}
+		stillBeating(t, f)
+	})
+
+	t.Run("max batch 11 does not delete past a failed chunk", func(t *testing.T) {
+		// Eleven records of one group are one handler batch and two delete
+		// calls. The first call fails as a whole; the 11th must not be sent.
+		f := newFake(11, func(int) string { return "g" })
+		f.failDeleteReceipt = "rh-m0"
+		cancel, done := startBatch(t, f, func(context.Context, []*Record) Result { return Result{} }, fifo(11, 1, time.Second))
+		defer stopBatch(t, cancel, done)
+		if !waitUntil(t, 3*time.Second, func() bool {
+			_, calls, _, _, _, _ := f.snapshot()
+			return len(calls) >= 2
+		}) {
+			t.Fatal("first chunk was not retried")
+		}
+		time.Sleep(300 * time.Millisecond) // a following 1-entry call would have landed
+		deleted, calls, _, _, _, _ := f.snapshot()
+		if len(deleted) != 0 {
+			t.Errorf("deleted = %v, want none", deleted)
+		}
+		for _, n := range calls {
+			if n == 1 {
+				t.Errorf("delete calls = %v, want no 1-entry tail call", calls)
+			}
+		}
+	})
+
+	t.Run("partial failure in the first chunk holds the next", func(t *testing.T) {
+		// m0 fails as an entry twice; m1..m9 share that call and may be
+		// deleted. m10 is a later call and must not be sent.
+		f := newFake(11, func(int) string { return "g" })
+		f.failDeleteAlways = map[string]bool{"rh-m0": true}
+		cancel, done := startBatch(t, f, func(context.Context, []*Record) Result { return Result{} }, fifo(11, 1, time.Second))
+		defer stopBatch(t, cancel, done)
+		if !waitUntil(t, 3*time.Second, func() bool {
+			d, _, _, _, _, _ := f.snapshot()
+			return len(d) >= 9
+		}) {
+			deleted, calls, _, _, _, _ := f.snapshot()
+			t.Fatalf("deleted = %v calls = %v, want m1..m9 removed", deleted, calls)
+		}
+		time.Sleep(300 * time.Millisecond)
+		deleted, calls, _, _, _, _ := f.snapshot()
+		sort.Strings(deleted)
+		if slices.Contains(deleted, "rh-m0") || slices.Contains(deleted, "rh-m10") {
+			t.Errorf("deleted = %v, want m1..m9 only", deleted)
+		}
+		if want := rh("m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9"); !slices.Equal(deleted, want) {
+			t.Errorf("deleted = %v, want %v", deleted, want)
+		}
+		if want := []int{10, 1}; !slices.Equal(calls, want) {
+			t.Errorf("delete calls = %v, want %v", calls, want)
+		}
+	})
+
+	t.Run("another group is still deleted", func(t *testing.T) {
+		f := newFake(11, func(i int) string {
+			if i == 10 {
+				return "b"
+			}
+			return "a"
+		})
+		f.failDeleteAlways = map[string]bool{"rh-m0": true}
+		runBatch(t, f, func(context.Context, []*Record) Result { return Result{} }, fifo(11, 1, time.Second), func() bool {
+			d, _, _, _, _, _ := f.snapshot()
+			return slices.Contains(d, "rh-m10")
+		})
+		deleted, _, _, _, _, _ := f.snapshot()
+		if !slices.Contains(deleted, "rh-m10") {
+			t.Errorf("deleted = %v, want group b's m10 deleted", deleted)
+		}
+		if slices.Contains(deleted, "rh-m0") {
+			t.Errorf("deleted = %v, want group a's head kept", deleted)
+		}
+	})
+}
